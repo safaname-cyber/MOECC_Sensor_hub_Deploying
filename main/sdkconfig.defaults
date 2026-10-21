@@ -1,0 +1,18 @@
+# Sensor Hub Deployment Controller - safety-relevant defaults (SOP §4.3, §8.3, §16)
+CONFIG_IDF_TARGET="esp32s3"
+# Brown-out detection -> reset (reset cause reported at boot)
+CONFIG_ESP_BROWNOUT_DET=y
+# Stack overflow detection -> vApplicationStackOverflowHook
+CONFIG_FREERTOS_CHECK_STACKOVERFLOW_CANARY=y
+# Task watchdog (firmware reconfigures to 3 s, panic on timeout)
+CONFIG_ESP_TASK_WDT_EN=y
+CONFIG_ESP_TASK_WDT_INIT=y
+CONFIG_ESP_TASK_WDT_PANIC=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=3
+# Panic -> reboot (boot never auto-moves)
+CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y
+# Console sharing: plain log lines (no ANSI colours), quiet bootloader
+CONFIG_LOG_COLORS=n
+CONFIG_BOOTLOADER_LOG_LEVEL_ERROR=y
+# Development: INFO. Production build: switch to CONFIG_LOG_DEFAULT_LEVEL_WARN=y
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
