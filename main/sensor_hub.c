@@ -5,10 +5,51 @@
  * Version  : 2.0.0  (MAJOR.MINOR.PATCH)                       [SOP §16 / F]
  * Hardware : 2 x SmartElex 15S (PWM 20 kHz + DIR), 2 x DENSO 12 V motors,
  *            2 x Orange 3806-OPTI-1000-AB-OC encoders (1000 PPR, NPN open
- *            collector, 5-24 V supply; PCNT x4 = 4000 cpr),
+ *            collector, 5-24 V supply; x4 interrupt decoding = 4000 cpr),
  *            4 x limit switches (active-low): per arm LS1 = stow, LS2 = deploy,
  *            2 x lock servos (LEDC 50 Hz, one per arm; set only at deploy).
  *            No hardware E-stop: 'X' (stop) is the software E-stop path.
+ *
+ * -----------------------------------------------------------------------------
+ * QUICK REFERENCE
+ *   Build + flash (close the monitor first; motor power OFF while flashing):
+ *     normal (encoder checks ON):
+ *       idf.py -DSHUB_BENCH_TEST=0 build
+ *       idf.py -p /dev/ttyUSB0 flash monitor
+ *     bench test (encoder fault checks OFF, boot shows "WARN BENCH_TEST"):
+ *       idf.py -DSHUB_BENCH_TEST=1 build
+ *       idf.py -p /dev/ttyUSB0 flash monitor
+ *     in the monitor: Ctrl+] = exit,  Ctrl+T then Ctrl+F = build + flash
+ *
+ *   Terminal commands (type in the monitor, then Enter;
+ *   1 = port, 2 = starboard, no number = both arms):
+ *     D  D1  D2        deploy (to LS2, then lock)
+ *     S  S1  S2        stow   (unlock, to LS1)
+ *     X  X1  X2        stop now (saves f1/f2, time, position)
+ *     G  G1  G2        start: resume a stopped move
+ *     G1D / G1S        start forward / reverse
+ *     G1D,10           start forward for 10 s   (1-180 s)
+ *     G1D,10,40        ... at 40 % speed        (15-100 %)
+ *     R  R1  R2        reset a fault / safety trip
+ *     L  L1  L2        lock   (only when deployed)
+ *     U  U1  U2        unlock
+ *     V50              default speed 50 % (saved)
+ *     T180             move timeout 180 s (10-900, saved)
+ *     K1,930           set port deploy position to 930 counts (fixed;
+ *                      K2,<n> stbd, K,<n> both; 101..1400)
+ *     C  C1  C2        clear deploy position (relearned at next LS2)
+ *     B1 / B0          bench mode ON / OFF (runtime, both arms idle; OFF
+ *                      after every reboot): encoder STALL / WRONG_DIR /
+ *                      OVERTRAVEL / SWITCH_STUCK and encoder end-stops OFF,
+ *                      counting + deploy-position learning stay ON
+ *     ?                status (per arm + sys line with raw switch pins)
+ *   JSON examples:
+ *     {"cmd":"deploy","side":"port"}   {"cmd":"stow"}   {"cmd":"stop"}
+ *     {"cmd":"start","side":"port","direction":"forward","time":10,"speed":0.4}
+ *     {"cmd":"status"}   legacy: {"command":"Deploy"} {"command":"Stow"}
+ *     {"cmd":"set_stroke","side":"port","value":930}
+ *     {"cmd":"clear_stroke","side":"port"}
+ *     {"cmd":"bench","value":1}   {"cmd":"bench","value":0}
  *
  * -----------------------------------------------------------------------------
  * TASKS (all statically allocated; each subscribes itself to the TWDT)
@@ -49,15 +90,37 @@
  *
  * MEMORY
  *   No malloc/free in application code. Queues, tasks and mutexes are static.
- *   Documented exception [SOP §8.1]: ESP-IDF drivers (UART, MCPWM, PCNT,
- *   NVS, LEDC, GPIO ISR service) allocate internally ONCE at init.
+ *   Documented exception [SOP §8.1]: ESP-IDF drivers (UART, MCPWM, NVS,
+ *   LEDC, GPIO ISR service) allocate internally ONCE at init.
  *   cJSON is NOT used (it mallocs); a fixed-buffer flat JSON parser is used.
  *
  * TIMING                                                [SOP §4.2, §7 / B, E]
- *   Motion loop 100 Hz: switches debounced over 50 ms (5 samples), encoder
- *   edges counted in hardware (PCNT). 5000 rpm x 4000 cpr = 333 kcount/s ->
- *   3333 counts/tick, inside the PCNT +/-30000 window (static-asserted).
- *   TWDT timeout 3 s.
+ *   Motion loop 100 Hz: switches debounced over 50 ms (5 samples). TWDT 3 s.
+ *
+ * ENCODER COUNTING (same algorithm as the STM32 "TetherCounter")
+ *   GPIO interrupt on every rising AND falling edge of A and B (both arms),
+ *   decoded with a 16-entry quadrature table (index = prev<<2 | new, state =
+ *   A<<1 | B; invalid transitions add 0). A and B are read from ONE
+ *   GPIO_IN_REG read (all encoder pins 0..31, static-asserted). ISR + table
+ *   in IRAM/DRAM; one IRAM GPIO ISR service (also used by the limit
+ *   switches), so edges are counted during NVS flash writes. Per-arm
+ *   spinlock: ISR is the only writer; motion_task reads / resets through
+ *   hal_enc_read() / hal_enc_clear() (same API as before). No PCNT.
+ *   Sign is the same as the old PCNT decode (A leading B = +1); the motion
+ *   task still applies enc_sign and keeps the NVS-restored offset in
+ *   arm_t.count (the decoder starts at 0 each boot, like before).
+ *   Cost / limit: ~2-4 us of one core per edge at 160 MHz (GPIO dispatch +
+ *   decode). Keep the total below ~50 kedges/s (< ~15 % of one core):
+ *     at 0.075 mm/count (GHW38 roller)        -> ~3.7 m/s cable speed;
+ *     at the measured 1.337 mm/count (Orange) -> far above the mechanism.
+ *   Hard ceiling (ISR saturates a core) ~250-300 kedges/s.
+ *   Measured port arm: ~200 counts/s at 100 % duty.
+ *   Hardware: ESP32-S3 GPIOs are NOT 5 V tolerant. A 5 V push-pull / line-
+ *   driver encoder needs a level shifter or RS-422 receiver; the Orange
+ *   open-collector encoder must be pulled up to 3.3 V only. Internal
+ *   pull-ups stay ON (harmless with push-pull, needed for open collector).
+ *   Pins: GPIO19/20 are the USB pads (released at boot) and GPIO3 is a
+ *   strapping pin — they work, but see the pin-map notes.
  *
  * COMMS-LOSS POLICY                                          [SOP §6 / C]
  *   Every move self-terminates (limit / time / timeout / fault), so silence
@@ -84,10 +147,10 @@
  *     8. LS2 closed                     -> ALREADY_DEPLOYED (lock set)
  *        both closed                    -> SWITCH_FAULT (fault BOTH_LIMITS)
  *     Before any start: pos_valid, stroke_valid, LS2 open and
- *     count > stroke + max(10 %, 0.5 turn) -> rejected POSITION_CONFLICT.
+ *     count > stroke + max(10 %, ~5 cm) -> rejected POSITION_CONFLICT.
  *   Stow (S, S1, S2): mirror — f2 continues, LS2 closed / LS1 open starts
  *     fresh, LS1 closed -> ALREADY_STOWED. Before any start: pos_valid,
- *     LS1 open and count < -0.5 turn -> rejected POSITION_CONFLICT.
+ *     LS1 open and count < -5 cm -> rejected POSITION_CONFLICT.
  *   Every start first opens the arm's lock and waits until it reads
  *   UNLOCKED before the motor may run.
  *   Start (G, G1, G2 / "start"): resumes a stopped move.
@@ -101,7 +164,7 @@
  *     pos_valid kept, NVS saved -> resumable after R.
  *   Reset (R): keeps f1 / f2, re-reads the switches; refused while both
  *     switches are closed.
- *   Idle: count moving > 0.05 turn with the motor off -> DRIFT warning
+ *   Idle: count moving > ~1.3 cm with the motor off -> DRIFT warning
  *     (once per stop). POSITION_LOST (switch released while idle) keeps
  *     pos_valid: the encoder still tracks the arm.
  *   Stop (X): halts, saves f1/f2, run time and encoder position to NVS.
@@ -130,20 +193,34 @@
  *   and rate_cps are known; in the ack, WINDOW_SHORT warning if ETA > window.
  *
  * WHILE DRIVING
- *   Approach: remaining < max(10 % stroke, 1 turn) -> duty capped at 25 %
+ *   Approach: remaining < max(10 % stroke, ~5 cm) -> duty capped at 25 %
  *     (forward needs stroke_valid, reverse needs pos_valid).
- *   Overtravel (with pos_valid): forward count > stroke + max(10 %, 0.5 turn)
- *     (MAX_STROKE_COUNTS until learned), reverse count < -0.5 turn ->
+ *   Overtravel (with pos_valid): forward count > stroke + max(10 %, ~5 cm)
+ *     (MAX_STROKE_COUNTS until learned), reverse count < -5 cm ->
  *     OVERTRAVEL. Without a position reference: travel > MAX_STROKE_COUNTS.
  *   Every 5 s the NVS record is saved as if stopped now (flag for this
  *   direction, time_used incl. this leg, count).
  *   Progress (500 ms): pos, % of stroke, duty, elapsed, window left, ETA.
  *   Stall / wrong-direction / switch checks as before.
  *
+ * ENCODER END FLAGS (virtual limit switches; either one stops the motor)
+ *   enc1 (at stow)   on at count <= 0,      off above +20 counts (~2.7 cm)
+ *   enc2 (at deploy) on at count >= stroke, off 20 counts below the stroke
+ *   Valid only with a known position (enc2 also needs the learned stroke).
+ *   Everywhere a limit switch is used, "at stow" = LS1 OR enc1 and "at
+ *   deploy" = LS2 OR enc2: stopping a move, deploy / stow / start
+ *   decisions, ALREADY_*, reset, boot, POSITION_LOST / UNKNOWN, WRONG_LIMIT,
+ *   SWITCH_STUCK. A closed physical switch wins over the other end's
+ *   encoder flag. BOTH_LIMITS stays a physical-switch fault. The switch is
+ *   checked first; a move ended by the encoder reports "...: encoder end,
+ *   LSx not seen" and is otherwise identical (lock at deploy, NVS, events).
+ *   The stroke is learned / count re-referenced only at a physical switch.
+ *   Status / per-arm / progress messages carry enc1 / enc2 next to ls1 / ls2.
+ *
  * COMPLETION
- *   LS2: ENCODER_MISMATCH warning if |count - stroke| > 0.1 turn; with
+ *   LS2: ENCODER_MISMATCH warning if |count - stroke| > ~2.7 cm; with
  *     pos_valid stroke = count (learned), else count = stroke if known.
- *   LS1: ENCODER_MISMATCH warning if |count| > 0.1 turn; count = 0,
+ *   LS1: ENCODER_MISMATCH warning if |count| > ~2.7 cm; count = 0,
  *     pos_valid = 1.
  *   Both: rate_cps learned (legs > 1 s: counts / integral of duty dt),
  *   f1 / f2 / time_used cleared, NVS saved, lock set at LS2 / open at LS1.
@@ -172,14 +249,21 @@
  *     lock / unlock        L  L1  L2 / U  U1  U2
  *     default speed        V<0..100>
  *     move timeout         T<10..900>   (seconds, NVS)
+ *     set deploy position  K1,<n> K2,<n> K,<n>  (counts 101..1400, fixed, NVS)
+ *     clear deploy pos.    C  C1  C2   (relearned at the next LS2)
  *     status               ?
  *   JSON ("side":"port|stbd|starboard|both", default both):
  *     {"cmd":"deploy|stow|stop|reset|lock|unlock","side":"port"}
  *     {"cmd":"start","side":"port","direction":"forward|reverse",
  *      "time":1-180,"speed":0.15-1.0}   direction / time / speed optional
  *     {"cmd":"set_speed","value":0.6}   {"cmd":"set_timeout","value":180}
+ *     {"cmd":"set_stroke","side":"port","value":930}  {"cmd":"clear_stroke","side":"port"}
+ *       set_stroke fixes the deploy position (LS2 hits then only warn
+ *       ENCODER_MISMATCH); clear_stroke forgets it -> learned at next LS2.
+ *       Rejected while that arm moves (BUSY) or out of range
+ *       (STROKE_OUT_OF_RANGE). Status shows stroke=<n>(fixed) / stroke_fixed.
  *     {"cmd":"status"}
- *     legacy: {"command":"Deploy|Retract"}  {"set_speed":0.6}
+ *     legacy: {"command":"Deploy|Stow"} (both arms)  {"set_speed":0.6}
  *             {"command":"Pause"} -> stop (pause does not exist)
  *
  *   PER-ARM REPLY / EVENT (one per arm addressed)
@@ -207,9 +291,9 @@
  *               SAFETY_TRIP                 trip during the lock / rest wait:
  *                                           start cancelled, send R
  *               WINDOW_SHORT                ETA > window (move still runs)
- *               ENCODER_MISMATCH            count off by > 0.1 turn at LS1
+ *               ENCODER_MISMATCH            count off by > ~2.7 cm at LS1
  *                                           (0) or LS2 (stroke)
- *               DRIFT                       count moved > 0.05 turn with the
+ *               DRIFT                       count moved > ~1.3 cm with the
  *                                           motor off
  *               STROKE_OUT_OF_RANGE         stroke not learned (bad count)
  *               BENCH_TEST / ABNORMAL_RESET boot warnings
@@ -232,7 +316,9 @@
  *      "f1","f2","pos_valid","count","pct","stroke","stroke_valid",
  *      "time_used_s","ls1","ls2","pos_m","rate_cps","servo_err","fault"}
  *     {"evt":"status","side":"sys","code":"STATUS","fw","speed","timeout_s",
- *      "uptime_s","txdrop","bench"}
+ *      "uptime_s","txdrop","bench","pin_p_ls1","pin_p_ls2","pin_s_ls1",
+ *      "pin_s_ls2"}   pin_* = raw switch pin level now: 1 high/released,
+ *      0 low/pressed (wiring diagnostic)
  *   SYSTEM replies:
  *     {"evt":"ack","cmd":"set_speed","code":"OK","speed",...}
  *     {"evt":"ack|rejected","cmd":"set_timeout","code":"OK|TIMEOUT_OUT_OF_RANGE",...}
@@ -257,7 +343,8 @@
  *                  interrupted.
  *
  * BENCH CALIBRATION REQUIRED (search "CALIBRATE")
- *   DRUM_DIA_M, GEAR_RATIO, MAX_STROKE_COUNTS, STALL_MIN_COUNTS,
+ *   STROKE_REF_COUNTS / STROKE_REF_M (measured on port: 935 counts = 1.25 m),
+ *   MAX_STROKE_COUNTS, STALL_MIN_COUNTS,
  *   SWITCH_RELEASE_COUNTS, per-arm
  *   deploy_dir_level and enc_sign, servo pulse widths and settle time.
  * ========================================================================== */
@@ -289,13 +376,14 @@
 #include "soc/gpio_sig_map.h"
 #include "soc/soc.h"
 #include "soc/usb_serial_jtag_reg.h"
+#include "soc/gpio_reg.h"
+#include "esp_attr.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 
 #include "driver/gpio.h"
 #include "driver/uart.h"
 #include "driver/ledc.h"
-#include "driver/pulse_cnt.h"
 #include "driver/mcpwm_prelude.h"
 
 /* =============================================================================
@@ -312,7 +400,7 @@ static const char *TAG = "SHUB";
  *   ENC B      GPIO19   GPIO3
  *   PWM        GPIO40   GPIO37
  *   DIR        GPIO41   GPIO38
- *   SERVO      GPIO35   GPIO47
+ *   SERVO      GPIO1    GPIO47
  *   LS1 stow   GPIO4    GPIO6
  *   LS2 deploy GPIO5    GPIO7
  *   UART0 console 43/44, UART1 system TX 17 / RX 16.
@@ -321,12 +409,23 @@ static const char *TAG = "SHUB";
  *     the USB-Serial-JTAG PHY at boot so they work as encoder inputs. The
  *     native USB port (and its console copy) is then unavailable; flash and
  *     monitor through the UART port.
- *   GPIO35/37 (and 36) are used by octal PSRAM / octal flash on WROOM-1
+ *   GPIO37 (with 35/36) is used by octal PSRAM / octal flash on WROOM-1
  *     N*R8 / N*R16 modules — this map needs a module WITHOUT octal PSRAM.
  *   GPIO3 is a strapping pin (JTAG source select; ignored unless the eFuse
  *     is burned). GPIO38 drives the RGB LED on DevKitC-1 v1.1 boards.
  * ========================================================================== */
 typedef enum { ARM_PORT = 0, ARM_STBD = 1, ARM_COUNT = 2 } arm_id_t;
+
+/* Encoder pins as plain numbers so the same-register requirement of the
+ * interrupt decoder can be checked at compile time (enc_read_ab reads A and
+ * B from ONE GPIO_IN_REG read: both pins must be 0..31). */
+#define PORT_ENC_A_GPIO     8
+#define PORT_ENC_B_GPIO     19
+#define STBD_ENC_A_GPIO     20
+#define STBD_ENC_B_GPIO     3
+_Static_assert((PORT_ENC_A_GPIO < 32) && (PORT_ENC_B_GPIO < 32) &&
+               (STBD_ENC_A_GPIO < 32) && (STBD_ENC_B_GPIO < 32),
+               "encoder A/B must be in GPIO bank 0 (GPIO_IN_REG, pins 0..31)");
 
 typedef struct {
     const char *name;           /* "port" / "stbd"                           */
@@ -334,8 +433,8 @@ typedef struct {
     gpio_num_t  dir_gpio;       /* SmartElex 15S DIR input                    */
     gpio_num_t  lim_deploy_gpio;/* LS2 deploy limit, active-low               */
     gpio_num_t  lim_stow_gpio;  /* LS1 stow limit, active-low                 */
-    gpio_num_t  enc_a_gpio;     /* encoder A (4.7k pull-up to 3V3)            */
-    gpio_num_t  enc_b_gpio;     /* encoder B (4.7k pull-up to 3V3)            */
+    gpio_num_t  enc_a_gpio;     /* encoder A (interrupt decoder, 3.3 V levels) */
+    gpio_num_t  enc_b_gpio;     /* encoder B (interrupt decoder, 3.3 V levels) */
     uint32_t    deploy_dir_level; /* DIR level that DEPLOYS this arm  CALIBRATE */
     int32_t     enc_sign;         /* +1/-1 so deploying increases count CALIBRATE */
     gpio_num_t  servo_gpio;     /* lock servo signal (LEDC)                   */
@@ -344,16 +443,16 @@ typedef struct {
 
 static const arm_hw_t ARM_HW[ARM_COUNT] = {
     /* name   PWM          DIR          LS2 DEP      LS1 STOW     ENC_A        ENC_B        DEP  SIGN  SERVO        SERVO_CH */
-    { "port", GPIO_NUM_40, GPIO_NUM_41, GPIO_NUM_5,  GPIO_NUM_4,  GPIO_NUM_8,  GPIO_NUM_19, 1U,  1,    GPIO_NUM_35, LEDC_CHANNEL_0 },
+    { "port", GPIO_NUM_40, GPIO_NUM_41, GPIO_NUM_5,  GPIO_NUM_4,  (gpio_num_t)PORT_ENC_A_GPIO, (gpio_num_t)PORT_ENC_B_GPIO, 1U,  1,    GPIO_NUM_1,  LEDC_CHANNEL_0 },
     /* Arms are mirrored: starboard deploy level / encoder sign must be
      * confirmed on the bench before first powered run.          CALIBRATE */
-    { "stbd", GPIO_NUM_37, GPIO_NUM_38, GPIO_NUM_7,  GPIO_NUM_6,  GPIO_NUM_20, GPIO_NUM_3,  1U,  1,    GPIO_NUM_47, LEDC_CHANNEL_1 },
+    { "stbd", GPIO_NUM_37, GPIO_NUM_38, GPIO_NUM_7,  GPIO_NUM_6,  (gpio_num_t)STBD_ENC_A_GPIO, (gpio_num_t)STBD_ENC_B_GPIO, 1U,  1,    GPIO_NUM_21, LEDC_CHANNEL_1 },
 };
 
 #define UART_FLASH_PORT     UART_NUM_0          /* default pins GPIO43/44     */
 #define UART_SYS_PORT       UART_NUM_1
 #define UART_SYS_TX_GPIO    GPIO_NUM_17
-#define UART_SYS_RX_GPIO    GPIO_NUM_16
+#define UART_SYS_RX_GPIO    GPIO_NUM_18
 #define UART_BAUD           115200
 #define UART_RX_BUF_BYTES   1024
 #define UART_TX_BUF_BYTES   1024
@@ -365,14 +464,18 @@ static const arm_hw_t ARM_HW[ARM_COUNT] = {
 #define DEBOUNCE_SAMPLES        5U          /* 5 x 10 ms = 50 ms (old firmware) */
 #define RAMP_TIME_MS            300U        /* 0 -> 100 % duty                  */
 #define DIR_DEADTIME_MS         200U
-#define STALL_GRACE_MS          400U
-#define STALL_WINDOW_MS         200U
-/* Count thresholds are written per 400 cpr and scaled to ENC_CPR so the
- * physical travel they represent does not change with encoder resolution. */
-#define STALL_MIN_COUNTS        (8 * ENC_CPR / 400)     /* CALIBRATE @ MIN_SPEED: expected/4 */
-#define SWITCH_RELEASE_COUNTS   (400 * ENC_CPR / 400)   /* CALIBRATE: travel to clear start switch */
-#define WRONG_DIR_COUNTS        (40 * ENC_CPR / 400)    /* counts the wrong way -> fault    */
-#define MAX_STROKE_COUNTS       (6000 * ENC_CPR / 400)  /* CALIBRATE: full stroke + margin  */
+/* ---- Encoder calibration from the port bench runs (2026-10-29):
+ *      stow (LS1) = 0, deploy (LS2) = ~935 counts (+-4), rope 1250 mm
+ *      -> ~1.337 mm / count; ~100 counts/s at 50 % duty, ~40 at 25 %.
+ *      Count thresholds below are in these counts. */
+#define STROKE_REF_COUNTS       935         /* CALIBRATE: measured LS1 -> LS2 count */
+#define STROKE_REF_M            1.25f       /* CALIBRATE: rope paid out over it      */
+#define STALL_GRACE_MS          1000U       /* slow start under load from a switch   */
+#define STALL_WINDOW_MS         500U
+#define STALL_MIN_COUNTS        4           /* ~5 mm per 500 ms (~20 cps at 15 %)    */
+#define SWITCH_RELEASE_COUNTS   100         /* ~13 cm: start switch must release     */
+#define WRONG_DIR_COUNTS        20          /* ~2.7 cm the wrong way -> fault        */
+#define MAX_STROKE_COUNTS       1400        /* ~1.9 m: stroke limit until learned    */
 
 /* Move timeout (total run time of one move, across stop/continue) */
 #define MOVE_TIMEOUT_DEFAULT_S  180U
@@ -380,10 +483,12 @@ static const arm_hw_t ARM_HW[ARM_COUNT] = {
 #define MOVE_TIMEOUT_MAX_S      900U
 
 /* Encoder position logic (stow = 0, deploy position learned at deploy limit) */
-#define HALF_TURN_COUNTS        (ENC_CPR / 2)
+#define END_MARGIN_COUNTS       40          /* ~5 cm: overtravel margin past an end  */
+#define APPROACH_MIN_COUNTS     40          /* ~5 cm: minimum slow-down zone         */
 #define APPROACH_DUTY_PCT       25.0f       /* duty cap near the end of travel   */
-#define MISMATCH_COUNTS         (ENC_CPR / 10)  /* 0.1 turn: ENCODER_MISMATCH    */
-#define DRIFT_COUNTS            (ENC_CPR / 20)  /* 0.05 turn idle: DRIFT warning */
+#define MISMATCH_COUNTS         20          /* ~2.7 cm: ENCODER_MISMATCH          */
+#define DRIFT_COUNTS            10          /* ~1.3 cm idle: DRIFT warning        */
+#define ENC_FLAG_HYST_COUNTS    20          /* ~2.7 cm: encoder end-flag release travel */
 
 /* Start command limits */
 #define START_TIME_MIN_S        1.0f
@@ -395,8 +500,8 @@ static const arm_hw_t ARM_HW[ARM_COUNT] = {
 #define WINDOW_MIN_MS           2000U       /* below -> WINDOW_EXHAUSTED         */
 #define BENCH_WINDOW_MIN_MS     120000U     /* SHUB_BENCH_TEST: window minimum   */
 
-/* Stow start refused if the arm reads this far behind stow (0.5 turn) */
-#define STOW_CONFLICT_COUNTS    HALF_TURN_COUNTS
+/* Stow start refused if the arm reads this far behind stow */
+#define STOW_CONFLICT_COUNTS    END_MARGIN_COUNTS
 
 /* Rate learning (rate_cps = counts/s at 100 % duty), at move completion */
 #define RATE_MIN_MOVE_MS        1000U       /* learn only from moves longer than */
@@ -443,16 +548,11 @@ static const arm_hw_t ARM_HW[ARM_COUNT] = {
 #define PWM_FREQ_HZ             20000UL     /* old firmware value               */
 #define MCPWM_PERIOD_TICKS      (MCPWM_RES_HZ / PWM_FREQ_HZ)   /* 500           */
 
-#define PCNT_HIGH_LIMIT         30000
-#define PCNT_LOW_LIMIT          (-30000)
-#define PCNT_GLITCH_NS          1000U
 
 /* Encoder calibration — same method as the winch external encoder. */
 #define ENC_PPR                 1000                     /* 3806-OPTI-1000-AB-OC */
 #define ENC_CPR                 (ENC_PPR * 4)            /* 4000 counts/rev     */
-#define DRUM_DIA_M              0.075f                   /* CALIBRATE (winch value) */
-#define GEAR_RATIO              1.0f                     /* CALIBRATE: encoder rev per drum rev */
-#define METERS_PER_COUNT        ((3.14159265f * DRUM_DIA_M) / ((float)ENC_CPR * GEAR_RATIO))
+#define METERS_PER_COUNT        (STROKE_REF_M / (float)STROKE_REF_COUNTS)   /* measured, ~1.337 mm */
 #define ENC_MAX_RPM             5000                     /* encoder rating (3806 series) */
 
 #define LINE_QUEUE_LEN          4U
@@ -486,8 +586,6 @@ _Static_assert(STALL_WINDOW_MS % CONTROL_PERIOD_MS == 0U, "stall window multiple
 _Static_assert(STALL_GRACE_MS > RAMP_TIME_MS, "stall grace must cover the soft-start ramp");
 _Static_assert(RAMP_TIME_MS >= CONTROL_PERIOD_MS, "ramp step must be <= 100 %");
 _Static_assert(MCPWM_PERIOD_TICKS >= 100UL && MCPWM_PERIOD_TICKS <= 65535UL, "MCPWM period range");
-_Static_assert((ENC_MAX_RPM / 60) * ENC_CPR * (int)CONTROL_PERIOD_MS / 1000 < PCNT_HIGH_LIMIT,
-               "max counts per tick must fit the PCNT window");
 _Static_assert(MAX_STROKE_COUNTS > 0 && MAX_STROKE_COUNTS < (INT32_MAX / 4), "stroke counts range");
 _Static_assert(SWITCH_RELEASE_COUNTS < MAX_STROKE_COUNTS, "release travel inside stroke");
 _Static_assert(EVT_RESERVED_SLOTS < EVT_QUEUE_LEN, "reserved event slots");
@@ -535,7 +633,8 @@ typedef struct {
 
 typedef enum {
     CMD_DEPLOY = 0, CMD_STOW, CMD_START, CMD_STOP, CMD_RESET,
-    CMD_LOCK, CMD_UNLOCK, CMD_SPEED, CMD_TIMEOUT, CMD_STATUS, CMD__COUNT
+    CMD_LOCK, CMD_UNLOCK, CMD_SPEED, CMD_TIMEOUT, CMD_STATUS,
+    CMD_SET_STROKE, CMD_CLEAR_STROKE, CMD_BENCH, CMD__COUNT
 } cmd_type_t;
 
 typedef enum { SIDE_BOTH = 0, SIDE_PORT, SIDE_STBD } side_t;
@@ -586,8 +685,9 @@ typedef struct {
     /* inputs */
     bool    raw_deploy, raw_stow;          /* raw (active = true)             */
     bool    lim_deploy, lim_stow;          /* debounced LS2 / LS1             */
+    bool    enc_deploy, enc_stow;          /* encoder end flags (virtual LS2 / LS1) */
     uint8_t deb_cnt_deploy, deb_cnt_stow;
-    int     pcnt_prev;
+    int     enc_prev;
     int32_t count;                         /* + = deployed side               */
     bool    dist_restored;
     bool    pos_valid;                     /* count referenced to stow = 0    */
@@ -597,6 +697,7 @@ typedef struct {
     uint32_t time_used_ms;                 /* run time of the stopped move    */
     int32_t  stroke;                       /* learned deploy position (counts) */
     bool     stroke_valid;
+    bool     stroke_fixed;                 /* set by hand (set_stroke): LS2 does not relearn */
     uint32_t rate_cps;                     /* counts/s at 100 % duty, 0 = unknown */
     uint32_t stop_time_ms;                 /* driven segment cut by last stop/fault */
 
@@ -644,11 +745,13 @@ typedef struct {
     int32_t      count;
     int32_t      stroke;                /* 0 = not learned                   */
     bool         stroke_valid;
+    bool         stroke_fixed;
     uint32_t     time_used_ms;
     uint32_t     rate_cps;
     bool         pos_valid;
     bool         servo_err;
     bool         ls1, ls2;              /* stow / deploy switch closed       */
+    bool         enc1, enc2;            /* encoder at stow / at deploy       */
     uint8_t      f1, f2;
     uint32_t     run_ms;
     uint32_t     leg_ms;                /* elapsed in this leg               */
@@ -676,7 +779,6 @@ typedef struct {
     mcpwm_cmpr_handle_t  cmpr;
     mcpwm_gen_handle_t   gen;
     bool                 forced_low;
-    pcnt_unit_handle_t   pcnt;
 } arm_hal_t;
 
 /* One NVS record per arm ("<arm>_rec"). Explicit padding, zeroed before use,
@@ -687,7 +789,8 @@ typedef struct {
     uint8_t  f2;               /* 0/1, never both 1                          */
     uint8_t  stroke_valid;     /* 0/1                                        */
     uint8_t  pos_valid;        /* 0/1: count is referenced to stow = 0       */
-    uint8_t  pad[2];           /* 0                                          */
+    uint8_t  stroke_fixed;     /* 0/1: stroke set by hand (was padding = 0)  */
+    uint8_t  pad[1];           /* 0                                          */
     uint32_t time_used_ms;
     int32_t  count;
     int32_t  stroke;
@@ -719,6 +822,7 @@ static bool         s_nvs_ok;
 /* motion <-> safety (atomics) */
 static _Atomic uint32_t s_timeout_s = MOVE_TIMEOUT_DEFAULT_S;  /* motion writes  */
 static _Atomic uint32_t s_trip;                     /* trip_t: safety sets, reset clears */
+static _Atomic bool     s_bench_rt;                 /* runtime bench mode (B1/B0); OFF at boot */
 static _Atomic bool     s_pwm_detached;             /* PWM pins forced to GPIO: reboot   */
 static _Atomic uint32_t s_motion_beat;              /* motion: +1 per tick               */
 static _Atomic uint32_t s_status_beat;              /* status: +1 per loop               */
@@ -757,7 +861,8 @@ static const char *const STATE_NAME[ST__COUNT] = {
     "STOWING", "STOPPED", "FAULT"
 };
 static const char *const CMD_NAME[CMD__COUNT] = {
-    "deploy", "stow", "start", "stop", "reset", "lock", "unlock", "set_speed", "set_timeout", "status"
+    "deploy", "stow", "start", "stop", "reset", "lock", "unlock", "set_speed", "set_timeout", "status",
+    "set_stroke", "clear_stroke", "bench"
 };
 static const char *const FAULT_NAME[FLT__COUNT] = {
     "NONE", "BOTH_LIMITS", "WRONG_LIMIT", "SWITCH_STUCK",
@@ -771,6 +876,15 @@ static const char *const LOCK_NAME[LOCK__COUNT] = {
  * Small helpers
  * ========================================================================== */
 static inline int64_t now_us(void) { return esp_timer_get_time(); }
+
+/* Bench mode: build option SHUB_BENCH_TEST=1 (forced) or runtime B1 / bench.
+ * ON  -> STALL / WRONG_DIR / OVERTRAVEL / SWITCH_STUCK off, encoder end flags
+ *        not used (limit switches only), no rate learning, window >= 120 s.
+ *        Encoder counting, position and stroke learning at LS2 stay ON. */
+static inline bool bench_active(void)
+{
+    return (SHUB_BENCH_TEST != 0) || atomic_load(&s_bench_rt);
+}
 static inline int64_t ms_to_us(uint32_t ms) { return (int64_t)ms * 1000LL; }
 
 static inline bool arm_is_moving(const arm_t *a)
@@ -976,18 +1090,80 @@ static bool hal_servo_write_us(arm_id_t id, uint32_t pulse_us)
 /* HAL: inputs (any task) */
 static inline bool hal_lim_raw(gpio_num_t pin) { return gpio_get_level(pin) == 0; }
 
+/* =============================================================================
+ * HAL: encoder — GPIO interrupt on every edge of A and B, 16-entry quadrature
+ * table (same algorithm as the STM32 TetherCounter). The ISR is the ONLY
+ * writer of pos / prev / isr_count; tasks read and reset under the spinlock.
+ * ========================================================================== */
+typedef struct {
+    portMUX_TYPE      mux;          /* guards pos / prev / isr_count       */
+    uint32_t          a_bit;        /* GPIO number of A (0..31)            */
+    uint32_t          b_bit;        /* GPIO number of B (0..31)            */
+    volatile int32_t  pos;          /* x4 counts, + forward, - reverse     */
+    volatile uint32_t isr_count;    /* debug: encoder interrupts handled   */
+    volatile uint8_t  prev;         /* previous state (A << 1) | B         */
+} enc_state_t;
+
+static DRAM_ATTR enc_state_t s_enc[ARM_COUNT];
+
+/* index = (prev << 2) | new, state = (A << 1) | B.  +1 forward, -1 reverse,
+ * 0 = no change or invalid (both bits changed = noise). */
+static DRAM_ATTR const int8_t s_qdec[16] = {
+     0, -1, +1,  0,
+    +1,  0,  0, -1,
+    -1,  0,  0, +1,
+     0, +1, -1,  0
+};
+_Static_assert((sizeof s_qdec / sizeof s_qdec[0]) == 16U, "quadrature table must have 16 entries");
+
+/* A and B from ONE register read, so both are sampled at the same moment. */
+static inline uint8_t IRAM_ATTR enc_read_ab(const enc_state_t *st)
+{
+    const uint32_t in = REG_READ(GPIO_IN_REG);
+    return (uint8_t)((((in >> st->a_bit) & 1U) << 1) | ((in >> st->b_bit) & 1U));
+}
+
+/* Every rising AND falling edge of A and B. Minimal: no logging, no FreeRTOS
+ * calls, no float. IRAM + DRAM only, so it keeps running during flash writes
+ * (ISR service installed with ESP_INTR_FLAG_IRAM). */
+static void IRAM_ATTR enc_isr(void *arg)
+{
+    enc_state_t *st = (enc_state_t *)arg;
+    portENTER_CRITICAL_ISR(&st->mux);
+    const uint8_t n = enc_read_ab(st);
+    st->pos += (int32_t)s_qdec[((uint32_t)st->prev << 2) | (uint32_t)n];
+    st->prev = n;
+    st->isr_count++;
+    portEXIT_CRITICAL_ISR(&st->mux);
+}
+
+/* Same API as before: 32-bit accumulated count since the last clear. */
 static int hal_enc_read(arm_id_t id)
 {
-    int v = 0;
-    esp_err_t e = pcnt_unit_get_count(s_hal[id].pcnt, &v);
-    if (e != ESP_OK) { hal_note_error("pcnt", e); }
-    return v;
+    enc_state_t *st = &s_enc[id];
+    portENTER_CRITICAL(&st->mux);
+    const int32_t v = st->pos;
+    portEXIT_CRITICAL(&st->mux);
+    return (int)v;
 }
 
 static void hal_enc_clear(arm_id_t id)
 {
-    esp_err_t e = pcnt_unit_clear_count(s_hal[id].pcnt);
-    if (e != ESP_OK) { hal_note_error("pcnt_clr", e); }
+    enc_state_t *st = &s_enc[id];
+    portENTER_CRITICAL(&st->mux);
+    st->pos       = 0;
+    st->isr_count = 0U;
+    st->prev      = enc_read_ab(st);
+    portEXIT_CRITICAL(&st->mux);
+}
+
+static uint32_t hal_enc_isr_count(arm_id_t id)      /* debug only */
+{
+    enc_state_t *st = &s_enc[id];
+    portENTER_CRITICAL(&st->mux);
+    const uint32_t n = st->isr_count;
+    portEXIT_CRITICAL(&st->mux);
+    return n;
 }
 
 /* =============================================================================
@@ -1048,6 +1224,19 @@ static esp_err_t hal_motor_init(arm_id_t id)
     return e;
 }
 
+/* One GPIO ISR service for encoders and limit switches, IRAM-resident so the
+ * encoder edges are still counted while flash (NVS) is being written.
+ * ESP_ERR_INVALID_STATE = already installed -> OK. */
+static esp_err_t hal_gpio_isr_service(void)
+{
+    static bool s_installed;                  /* boot-time only (app_main)  */
+    if (s_installed) { return ESP_OK; }       /* avoid IDF "already installed" error log */
+    esp_err_t e = gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
+    if (e == ESP_ERR_INVALID_STATE) { e = ESP_OK; }
+    if (e == ESP_OK) { s_installed = true; }
+    return e;
+}
+
 /* GPIO19/20 carry encoder signals: detach the USB-Serial-JTAG PHY from the
  * pads and drop its D+/D- pulls, so they behave as plain GPIO inputs. */
 static void hal_usb_pads_release(void)
@@ -1060,35 +1249,32 @@ static void hal_usb_pads_release(void)
 
 static esp_err_t hal_encoder_init(arm_id_t id)
 {
-    arm_hal_t *h = &s_hal[id];
-    const pcnt_unit_config_t ucfg = {
-        .high_limit = PCNT_HIGH_LIMIT,
-        .low_limit  = PCNT_LOW_LIMIT,
-        .flags.accum_count = 1,
-    };
-    const pcnt_glitch_filter_config_t fcfg = { .max_glitch_ns = PCNT_GLITCH_NS };
-    const pcnt_chan_config_t ca = { .edge_gpio_num = ARM_HW[id].enc_a_gpio, .level_gpio_num = ARM_HW[id].enc_b_gpio };
-    const pcnt_chan_config_t cb = { .edge_gpio_num = ARM_HW[id].enc_b_gpio, .level_gpio_num = ARM_HW[id].enc_a_gpio };
-    pcnt_channel_handle_t cha = NULL;
-    pcnt_channel_handle_t chb = NULL;
+    if ((uint32_t)id >= (uint32_t)ARM_COUNT) { return ESP_ERR_INVALID_ARG; }
+    enc_state_t *st = &s_enc[id];
+    portMUX_INITIALIZE(&st->mux);
+    st->a_bit = (uint32_t)ARM_HW[id].enc_a_gpio;
+    st->b_bit = (uint32_t)ARM_HW[id].enc_b_gpio;
 
-    esp_err_t e = pcnt_new_unit(&ucfg, &h->pcnt);
-    if (e == ESP_OK) { e = pcnt_unit_set_glitch_filter(h->pcnt, &fcfg); }
-    if (e == ESP_OK) { e = pcnt_new_channel(h->pcnt, &ca, &cha); }
-    if (e == ESP_OK) { e = pcnt_new_channel(h->pcnt, &cb, &chb); }
-    if (e == ESP_OK) { e = pcnt_channel_set_edge_action(cha, PCNT_CHANNEL_EDGE_ACTION_DECREASE, PCNT_CHANNEL_EDGE_ACTION_INCREASE); }
-    if (e == ESP_OK) { e = pcnt_channel_set_level_action(cha, PCNT_CHANNEL_LEVEL_ACTION_KEEP, PCNT_CHANNEL_LEVEL_ACTION_INVERSE); }
-    if (e == ESP_OK) { e = pcnt_channel_set_edge_action(chb, PCNT_CHANNEL_EDGE_ACTION_INCREASE, PCNT_CHANNEL_EDGE_ACTION_DECREASE); }
-    if (e == ESP_OK) { e = pcnt_channel_set_level_action(chb, PCNT_CHANNEL_LEVEL_ACTION_KEEP, PCNT_CHANNEL_LEVEL_ACTION_INVERSE); }
-    /* accum_count needs the limits as watch points */
-    if (e == ESP_OK) { e = pcnt_unit_add_watch_point(h->pcnt, PCNT_HIGH_LIMIT); }
-    if (e == ESP_OK) { e = pcnt_unit_add_watch_point(h->pcnt, PCNT_LOW_LIMIT); }
-    if (e == ESP_OK) { e = pcnt_unit_enable(h->pcnt); }
-    if (e == ESP_OK) { e = pcnt_unit_clear_count(h->pcnt); }
-    if (e == ESP_OK) { e = pcnt_unit_start(h->pcnt); }
-    /* Internal pull-ups as backup to the external 4.7k pull-ups. */
-    if (e == ESP_OK) { e = gpio_pullup_en(ARM_HW[id].enc_a_gpio); }
-    if (e == ESP_OK) { e = gpio_pullup_en(ARM_HW[id].enc_b_gpio); }
+    /* Pull-ups ON: harmless with a push-pull line driver, and required by the
+     * open-collector Orange 3806 if no external pull-ups are fitted. */
+    const gpio_config_t io = {
+        .pin_bit_mask = (1ULL << st->a_bit) | (1ULL << st->b_bit),
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_ANYEDGE,          /* rising AND falling */
+    };
+    esp_err_t e = gpio_config(&io);
+    if (e == ESP_OK) { e = hal_gpio_isr_service(); }
+    if (e == ESP_OK) {
+        portENTER_CRITICAL(&st->mux);               /* seed before the first edge */
+        st->pos       = 0;
+        st->isr_count = 0U;
+        st->prev      = enc_read_ab(st);
+        portEXIT_CRITICAL(&st->mux);
+    }
+    if (e == ESP_OK) { e = gpio_isr_handler_add(ARM_HW[id].enc_a_gpio, enc_isr, st); }
+    if (e == ESP_OK) { e = gpio_isr_handler_add(ARM_HW[id].enc_b_gpio, enc_isr, st); }
     return e;
 }
 
@@ -1117,7 +1303,7 @@ static esp_err_t hal_limits_init(void)
         .intr_type    = GPIO_INTR_ANYEDGE,
     };
     esp_err_t e = gpio_config(&io);
-    if (e == ESP_OK) { e = gpio_install_isr_service(0); }
+    if (e == ESP_OK) { e = hal_gpio_isr_service(); }
     for (uint32_t i = 0U; (i < (uint32_t)ARM_COUNT) && (e == ESP_OK); i++) {
         e = gpio_isr_handler_add(ARM_HW[i].lim_deploy_gpio, limit_isr, NULL);
         if (e == ESP_OK) { e = gpio_isr_handler_add(ARM_HW[i].lim_stow_gpio, limit_isr, NULL); }
@@ -1195,6 +1381,7 @@ static void arm_rec_build(arm_id_t id, arm_rec_t *r)
     r->f2           = a->f2;
     r->stroke_valid = a->stroke_valid ? 1U : 0U;
     r->pos_valid    = a->pos_valid ? 1U : 0U;
+    r->stroke_fixed = (a->stroke_valid && a->stroke_fixed) ? 1U : 0U;
     r->time_used_ms = (a->time_used_ms > TIME_MAX_MS) ? TIME_MAX_MS : a->time_used_ms;
     if (a->drive_started) {
         r->f1 = (a->dir == DIR_DEPLOY) ? 1U : 0U;
@@ -1217,7 +1404,8 @@ static bool arm_rec_valid(const arm_rec_t *r)
     if (r->crc != arm_rec_crc(r))                                    { return false; }
     if ((r->f1 > 1U) || (r->f2 > 1U) || ((r->f1 + r->f2) > 1U))      { return false; }
     if ((r->stroke_valid > 1U) || (r->pos_valid > 1U))               { return false; }
-    if ((r->pad[0] | r->pad[1]) != 0U)                               { return false; }
+    if (r->pad[0] != 0U)                                             { return false; }
+    if ((r->stroke_fixed > 1U) || ((r->stroke_fixed != 0U) && (r->stroke_valid == 0U))) { return false; }
     if (r->time_used_ms > (MOVE_TIMEOUT_MAX_S * 1000U))              { return false; }
     if ((r->count < -(2 * MAX_STROKE_COUNTS)) || (r->count > (2 * MAX_STROKE_COUNTS))) { return false; }
     if (r->stroke_valid != 0U) {
@@ -1252,21 +1440,21 @@ static inline float arm_speed(const arm_t *a)
     return (a->speed_override > 0.0f) ? a->speed_override : fabsf(s_speed);
 }
 
-/* Forward overtravel limit: stroke + max(10 %, 0.5 turn); MAX_STROKE_COUNTS
+/* Forward overtravel limit: stroke + max(10 %, END_MARGIN_COUNTS); MAX_STROKE_COUNTS
  * stands in for the stroke until it is learned. */
 static int32_t fwd_overtravel_limit(const arm_t *a)
 {
     const int32_t st = a->stroke_valid ? a->stroke : MAX_STROKE_COUNTS;
     int32_t m = st / 10;
-    if (m < HALF_TURN_COUNTS) { m = HALF_TURN_COUNTS; }
+    if (m < END_MARGIN_COUNTS) { m = END_MARGIN_COUNTS; }
     return st + m;
 }
 
-/* Approach zone: max(10 % of stroke, 1 turn). */
+/* Approach zone: max(10 % of stroke, APPROACH_MIN_COUNTS). */
 static int32_t approach_zone(const arm_t *a)
 {
     const int32_t z = a->stroke_valid ? (a->stroke / 10) : 0;
-    return (z > ENC_CPR) ? z : ENC_CPR;
+    return (z > APPROACH_MIN_COUNTS) ? z : APPROACH_MIN_COUNTS;
 }
 
 /* Remaining counts to the end of a move in dir, or -1 if not known. */
@@ -1316,18 +1504,18 @@ static void ev_arm_snap(route_t route, bool critical, const char *evt, const cha
     msg_code(msg, ok, code, sizeof code);
     const float pos = (float)s->count * METERS_PER_COUNT;
     const float tsec = (float)s->run_ms / 1000.0f;
-    (void)snprintf(t, sizeof t, "%s side=%s state=%s lock=%s f1=%u f2=%u ls1=%d ls2=%d pos=%.3f m pct=%d t=%.1f s%s%s%s",
+    (void)snprintf(t, sizeof t, "%s side=%s state=%s lock=%s f1=%u f2=%u ls1=%d ls2=%d enc1=%d enc2=%d pos=%.3f m pct=%d t=%.1f s%s%s%s",
                    msg, ARM_HW[id].name, STATE_NAME[s->state], LOCK_NAME[s->lock],
-                   (unsigned)s->f1, (unsigned)s->f2, s->ls1 ? 1 : 0, s->ls2 ? 1 : 0,
+                   (unsigned)s->f1, (unsigned)s->f2, s->ls1 ? 1 : 0, s->ls2 ? 1 : 0, s->enc1 ? 1 : 0, s->enc2 ? 1 : 0,
                    (double)pos, snap_pct(s), (double)tsec,
                    (s->fault != FLT_NONE) ? " fault=" : "", (s->fault != FLT_NONE) ? FAULT_NAME[s->fault] : "",
                    s->servo_err ? " SERVO_ERR" : "");
     (void)snprintf(j, sizeof j,
                    "{\"evt\":\"%s\",\"cmd\":\"%s\",\"side\":\"%s\",\"ok\":%s,\"code\":\"%s\",\"state\":\"%s\","
-                   "\"lock\":\"%s\",\"f1\":%u,\"f2\":%u,\"ls1\":%d,\"ls2\":%d,\"pos_m\":%.3f,\"pct\":%d,"
-                   "\"time_s\":%.1f,\"servo_err\":%d,\"fault\":\"%s\",\"msg\":\"%s\"}",
+                   "\"lock\":\"%s\",\"f1\":%u,\"f2\":%u,\"ls1\":%d,\"ls2\":%d,\"enc1\":%d,\"enc2\":%d,"
+                   "\"pos_m\":%.3f,\"pct\":%d,\"time_s\":%.1f,\"servo_err\":%d,\"fault\":\"%s\",\"msg\":\"%s\"}",
                    evt, cmd, ARM_HW[id].name, ok ? "true" : "false", code, STATE_NAME[s->state], LOCK_NAME[s->lock],
-                   (unsigned)s->f1, (unsigned)s->f2, s->ls1 ? 1 : 0, s->ls2 ? 1 : 0,
+                   (unsigned)s->f1, (unsigned)s->f2, s->ls1 ? 1 : 0, s->ls2 ? 1 : 0, s->enc1 ? 1 : 0, s->enc2 ? 1 : 0,
                    (double)pos, snap_pct(s), (double)tsec, s->servo_err ? 1 : 0, FAULT_NAME[s->fault], msg);
     tx_post(route, critical, t, j);
 }
@@ -1340,21 +1528,21 @@ static void ev_status_arm(route_t route, arm_id_t id, const arm_snap_t *s)
     const float pos = (float)s->count * METERS_PER_COUNT;
     (void)snprintf(t, sizeof t,
                    "STATUS side=%s state=%s lock=%s f1=%u f2=%u pos_valid=%d count=%ld pct=%d stroke=%ld%s "
-                   "time_used=%.1f s ls1=%d ls2=%d pos=%.3f m rate=%lu cps fault=%s%s",
+                   "time_used=%.1f s ls1=%d ls2=%d enc1=%d enc2=%d pos=%.3f m rate=%lu cps fault=%s%s",
                    ARM_HW[id].name, STATE_NAME[s->state], LOCK_NAME[s->lock], (unsigned)s->f1, (unsigned)s->f2,
                    s->pos_valid ? 1 : 0, (long)s->count, snap_pct(s), (long)s->stroke,
-                   s->stroke_valid ? "" : "(none)", (double)s->time_used_ms / 1000.0,
-                   s->ls1 ? 1 : 0, s->ls2 ? 1 : 0, (double)pos, (unsigned long)s->rate_cps,
+                   s->stroke_valid ? (s->stroke_fixed ? "(fixed)" : "") : "(none)", (double)s->time_used_ms / 1000.0,
+                   s->ls1 ? 1 : 0, s->ls2 ? 1 : 0, s->enc1 ? 1 : 0, s->enc2 ? 1 : 0, (double)pos, (unsigned long)s->rate_cps,
                    FAULT_NAME[s->fault], s->servo_err ? " SERVO_ERR" : "");
     (void)snprintf(j, sizeof j,
                    "{\"evt\":\"status\",\"cmd\":\"status\",\"side\":\"%s\",\"ok\":%s,\"code\":\"STATUS\","
                    "\"state\":\"%s\",\"lock\":\"%s\",\"f1\":%u,\"f2\":%u,\"pos_valid\":%d,\"count\":%ld,"
-                   "\"pct\":%d,\"stroke\":%ld,\"stroke_valid\":%d,\"time_used_s\":%.1f,\"ls1\":%d,\"ls2\":%d,"
+                   "\"pct\":%d,\"stroke\":%ld,\"stroke_valid\":%d,\"stroke_fixed\":%d,\"time_used_s\":%.1f,\"ls1\":%d,\"ls2\":%d,\"enc1\":%d,\"enc2\":%d,"
                    "\"pos_m\":%.3f,\"rate_cps\":%lu,\"servo_err\":%d,\"fault\":\"%s\"}",
                    ARM_HW[id].name, (s->fault == FLT_NONE) ? "true" : "false", STATE_NAME[s->state],
                    LOCK_NAME[s->lock], (unsigned)s->f1, (unsigned)s->f2, s->pos_valid ? 1 : 0, (long)s->count,
-                   snap_pct(s), (long)s->stroke, s->stroke_valid ? 1 : 0, (double)s->time_used_ms / 1000.0,
-                   s->ls1 ? 1 : 0, s->ls2 ? 1 : 0, (double)pos, (unsigned long)s->rate_cps,
+                   snap_pct(s), (long)s->stroke, s->stroke_valid ? 1 : 0, s->stroke_fixed ? 1 : 0, (double)s->time_used_ms / 1000.0,
+                   s->ls1 ? 1 : 0, s->ls2 ? 1 : 0, s->enc1 ? 1 : 0, s->enc2 ? 1 : 0, (double)pos, (unsigned long)s->rate_cps,
                    s->servo_err ? 1 : 0, FAULT_NAME[s->fault]);
     tx_post(route, false, t, j);
 }
@@ -1373,10 +1561,11 @@ static void ev_progress_snap(arm_id_t id, const arm_snap_t *s)
                    (double)left, (double)eta, (unsigned)s->f1, (unsigned)s->f2);
     (void)snprintf(j, sizeof j,
                    "{\"evt\":\"progress\",\"cmd\":\"%s\",\"side\":\"%s\",\"ok\":true,\"code\":\"PROGRESS\",\"state\":\"%s\","
-                   "\"lock\":\"%s\",\"f1\":%u,\"f2\":%u,\"ls1\":%d,\"ls2\":%d,\"pos_m\":%.3f,\"pct\":%d,"
+                   "\"lock\":\"%s\",\"f1\":%u,\"f2\":%u,\"ls1\":%d,\"ls2\":%d,\"enc1\":%d,\"enc2\":%d,\"pos_m\":%.3f,\"pct\":%d,"
                    "\"duty\":%.0f,\"elapsed_s\":%.1f,\"window_left_s\":%.1f,\"eta_s\":%.1f,\"time_s\":%.1f}",
                    s->move_cmd, ARM_HW[id].name, STATE_NAME[s->state], LOCK_NAME[s->lock],
-                   (unsigned)s->f1, (unsigned)s->f2, s->ls1 ? 1 : 0, s->ls2 ? 1 : 0, (double)pos, snap_pct(s),
+                   (unsigned)s->f1, (unsigned)s->f2, s->ls1 ? 1 : 0, s->ls2 ? 1 : 0, s->enc1 ? 1 : 0, s->enc2 ? 1 : 0,
+                   (double)pos, snap_pct(s),
                    (double)s->duty, (double)el, (double)left, (double)eta, (double)s->run_ms / 1000.0);
     tx_post(s->route, false, t, j);
 }
@@ -1387,14 +1576,26 @@ static void ev_sys_status(route_t route, const sys_snap_t *ss)
     char j[TX_JSON_MAX];
     const unsigned long drops = (unsigned long)atomic_load(&s_tx_drop);
     const unsigned long up = (unsigned long)(now_us() / 1000000LL);
-    (void)snprintf(t, sizeof t, "STATUS sys fw=%s speed=%.2f timeout=%lus uptime=%lus txdrop=%lu%s",
+    /* Raw electrical level of each limit-switch pin, read now (1 = high =
+     * released, 0 = low = pressed) — wiring diagnostic, independent of the
+     * debounced ls1 / ls2 values. */
+    const int p1 = gpio_get_level(ARM_HW[ARM_PORT].lim_stow_gpio);
+    const int p2 = gpio_get_level(ARM_HW[ARM_PORT].lim_deploy_gpio);
+    const int s1 = gpio_get_level(ARM_HW[ARM_STBD].lim_stow_gpio);
+    const int s2 = gpio_get_level(ARM_HW[ARM_STBD].lim_deploy_gpio);
+    (void)snprintf(t, sizeof t,
+                   "STATUS sys fw=%s speed=%.2f timeout=%lus uptime=%lus txdrop=%lu%s "
+                   "pins: P_LS1(GPIO%d)=%d P_LS2(GPIO%d)=%d S_LS1(GPIO%d)=%d S_LS2(GPIO%d)=%d",
                    FW_VERSION, (double)fabsf(ss->speed), (unsigned long)ss->timeout_s, up, drops,
-                   SHUB_BENCH_TEST ? " BENCH_TEST" : "");
+                   bench_active() ? " BENCH_TEST" : "",
+                   (int)ARM_HW[ARM_PORT].lim_stow_gpio, p1, (int)ARM_HW[ARM_PORT].lim_deploy_gpio, p2,
+                   (int)ARM_HW[ARM_STBD].lim_stow_gpio, s1, (int)ARM_HW[ARM_STBD].lim_deploy_gpio, s2);
     (void)snprintf(j, sizeof j,
                    "{\"evt\":\"status\",\"side\":\"sys\",\"code\":\"STATUS\",\"fw\":\"%s\",\"speed\":%.2f,\"timeout_s\":%lu,"
-                   "\"uptime_s\":%lu,\"txdrop\":%lu,\"bench\":%s}",
+                   "\"uptime_s\":%lu,\"txdrop\":%lu,\"bench\":%s,"
+                   "\"pin_p_ls1\":%d,\"pin_p_ls2\":%d,\"pin_s_ls1\":%d,\"pin_s_ls2\":%d}",
                    FW_VERSION, (double)fabsf(ss->speed), (unsigned long)ss->timeout_s, up, drops,
-                   SHUB_BENCH_TEST ? "true" : "false");
+                   bench_active() ? "true" : "false", p1, p2, s1, s2);
     tx_post(route, false, t, j);
 }
 
@@ -1420,12 +1621,15 @@ static void snap_fill(arm_id_t id, arm_snap_t *s, int64_t t)
     s->count      = a->count;
     s->stroke     = a->stroke_valid ? a->stroke : 0;
     s->stroke_valid = a->stroke_valid;
+    s->stroke_fixed = a->stroke_fixed;
     s->time_used_ms = a->time_used_ms;
     s->rate_cps   = a->rate_cps;
     s->pos_valid  = a->pos_valid;
     s->servo_err  = a->servo_err;
     s->ls1        = a->lim_stow;
     s->ls2        = a->lim_deploy;
+    s->enc1       = a->enc_stow;
+    s->enc2       = a->enc_deploy;
     s->f1         = a->f1;
     s->f2         = a->f2;
     s->leg_ms     = a->drive_started ? (uint32_t)((t - a->move_start_us) / 1000LL) : 0U;
@@ -1488,13 +1692,43 @@ static void motor_out(arm_id_t id, float duty, move_dir_t dir)
 /* =============================================================================
  * MOTION: encoder reference, locks
  * ========================================================================== */
+/* ---- Encoder end flags: virtual LS1 / LS2 from the encoder position ----
+ * enc_stow   on at count <= 0,      off once count >  ENC_FLAG_HYST_COUNTS
+ * enc_deploy on at count >= stroke, off once count <  stroke - ENC_FLAG_HYST
+ * Only with a known position (enc_deploy also needs the learned stroke).
+ * Used exactly like the switches: "at stow" = LS1 or enc_stow, "at deploy"
+ * = LS2 or enc_deploy. A closed physical switch wins over the other end's
+ * encoder flag; BOTH_LIMITS stays a physical-switch fault. */
+static void enc_flags_update(arm_t *a)
+{
+    if (!a->pos_valid) { a->enc_stow = false; a->enc_deploy = false; return; }
+    if (a->count <= 0)                          { a->enc_stow = true; }
+    else if (a->count > ENC_FLAG_HYST_COUNTS)   { a->enc_stow = false; }
+    else                                        { /* hold */ }
+    if (!a->stroke_valid)                                   { a->enc_deploy = false; }
+    else if (a->count >= a->stroke)                         { a->enc_deploy = true; }
+    else if (a->count < (a->stroke - ENC_FLAG_HYST_COUNTS)) { a->enc_deploy = false; }
+    else                                                    { /* hold */ }
+}
+
+/* Boot / re-reference: no history, so use the release band directly. */
+static void enc_flags_init(arm_t *a)
+{
+    a->enc_stow   = a->pos_valid && (a->count <= ENC_FLAG_HYST_COUNTS);
+    a->enc_deploy = a->pos_valid && a->stroke_valid && (a->count >= (a->stroke - ENC_FLAG_HYST_COUNTS));
+}
+
+static inline bool arm_at_stow(const arm_t *a)   { return a->lim_stow   || (!bench_active() && a->enc_stow   && !a->lim_deploy); }
+static inline bool arm_at_deploy(const arm_t *a) { return a->lim_deploy || (!bench_active() && a->enc_deploy && !a->lim_stow); }
+
 static void enc_zero(arm_id_t id)
 {
     hal_enc_clear(id);
-    s_arm[id].pcnt_prev     = 0;
+    s_arm[id].enc_prev     = 0;
     s_arm[id].count         = 0;
     s_arm[id].dist_restored = false;
     s_arm[id].pos_valid     = true;
+    enc_flags_update(&s_arm[id]);
 }
 
 /* Deploy limit = learned deploy position (if stow reference known). */
@@ -1502,7 +1736,7 @@ static void apply_deploy_reference(arm_id_t id)
 {
     arm_t *a = &s_arm[id];
     if (a->pos_valid && !a->dist_restored) {
-        if ((a->count > SWITCH_RELEASE_COUNTS) && (a->count <= MAX_STROKE_COUNTS) &&
+        if (!a->stroke_fixed && (a->count > SWITCH_RELEASE_COUNTS) && (a->count <= MAX_STROKE_COUNTS) &&
             (!a->stroke_valid || (a->count != a->stroke))) {
             a->stroke = a->count;              /* saved with the arm record   */
             a->stroke_valid = true;
@@ -1566,8 +1800,8 @@ static void state_from_switches(arm_id_t id)
     a->raw_deploy = hal_lim_raw(ARM_HW[id].lim_deploy_gpio);
     a->raw_stow   = hal_lim_raw(ARM_HW[id].lim_stow_gpio);
     if (a->lim_deploy && a->lim_stow) { a->state = ST_FAULT; a->fault = FLT_BOTH_LIMITS; }
-    else if (a->lim_stow)             { a->state = ST_STOWED; }
-    else if (a->lim_deploy)           { a->state = ST_DEPLOYED; }
+    else if (arm_at_stow(a))          { a->state = ST_STOWED; }       /* LS1 or encoder */
+    else if (arm_at_deploy(a))        { a->state = ST_DEPLOYED; }     /* LS2 or encoder */
     else                              { a->state = (a->f1 || a->f2) ? ST_STOPPED : ST_UNKNOWN; }
 }
 
@@ -1583,6 +1817,7 @@ static void state_from_switches(arm_id_t id)
 static void boot_classify(arm_id_t id, bool rec_valid, bool rec_pos_valid)
 {
     arm_t *a = &s_arm[id];
+    enc_flags_init(a);                        /* from the restored count / stroke */
     if (a->lim_deploy && a->lim_stow) {
         a->state = ST_FAULT;
         a->fault = FLT_BOTH_LIMITS;
@@ -1595,6 +1830,12 @@ static void boot_classify(arm_id_t id, bool rec_valid, bool rec_pos_valid)
         a->f1 = 0U; a->f2 = 0U; a->time_used_ms = 0U;
         if (a->stroke_valid) { a->count = a->stroke; }
         a->pos_valid = a->stroke_valid || (rec_valid && rec_pos_valid);
+    } else if (rec_valid && rec_pos_valid && (a->enc_stow || a->enc_deploy)) {
+        /* both switches open, encoder says it is at an end: same as that switch */
+        a->pos_valid = true;
+        a->state = a->enc_stow ? ST_STOWED : ST_DEPLOYED;
+        if (a->enc_deploy && a->stroke_valid) { a->count = a->stroke; }
+        a->f1 = 0U; a->f2 = 0U; a->time_used_ms = 0U;
     } else if (rec_valid) {
         a->pos_valid = rec_pos_valid;
         a->state = (a->f1 || a->f2) ? ST_STOPPED : ST_UNKNOWN;
@@ -1699,7 +1940,7 @@ static void arm_begin_drive(arm_id_t id, int64_t t)
     a->limit_hold       = false;
     a->move_start_us    = t;
     a->start_count      = a->count;
-    a->start_switch_was_pressed = (a->dir == DIR_DEPLOY) ? a->lim_stow : a->lim_deploy;
+    a->start_switch_was_pressed = (a->dir == DIR_DEPLOY) ? arm_at_stow(a) : arm_at_deploy(a);
     a->move_seq++;                            /* status_task restarts its checks */
     if (!a->continuing) { a->time_used_ms = 0U; }   /* fresh move / reversal */
     a->full_duty_s        = 0.0f;
@@ -1722,7 +1963,7 @@ static bool arm_start_move(arm_id_t id, move_dir_t dir, route_t route, int64_t t
     if (time_ms > 0U)     { window = time_ms; }
     else if (continuing)  { window = (timeout_ms > a->time_used_ms) ? (timeout_ms - a->time_used_ms) : 0U; }
     else                  { window = timeout_ms; }
-    if (SHUB_BENCH_TEST && (time_ms == 0U) && (window < BENCH_WINDOW_MIN_MS)) { window = BENCH_WINDOW_MIN_MS; }
+    if (bench_active() && (time_ms == 0U) && (window < BENCH_WINDOW_MIN_MS)) { window = BENCH_WINDOW_MIN_MS; }
     if (window < WINDOW_MIN_MS) {
         char msg[80];
         (void)snprintf(msg, sizeof msg, "WINDOW_EXHAUSTED: %.1f s left of %lu s - reverse or set_timeout",
@@ -1779,7 +2020,7 @@ static void ack_started(const cmd_t *c, arm_id_t id, const char *what)
 static void arm_learn_rate(arm_id_t id, int64_t t)
 {
     arm_t *a = &s_arm[id];
-    if (SHUB_BENCH_TEST || ((t - a->move_start_us) <= ms_to_us(RATE_MIN_MOVE_MS)) || !(a->full_duty_s > 0.0f)) {
+    if (bench_active() || ((t - a->move_start_us) <= ms_to_us(RATE_MIN_MOVE_MS)) || !(a->full_duty_s > 0.0f)) {
         return;
     }
     int32_t moved = a->count - a->start_count;
@@ -1791,7 +2032,7 @@ static void arm_learn_rate(arm_id_t id, int64_t t)
     a->rate_cps = (old == 0) ? (uint32_t)m : (uint32_t)(old + ((m - old) / RATE_EMA_DIV));
 }
 
-static void arm_complete(arm_id_t id, int64_t t)
+static void arm_complete(arm_id_t id, int64_t t, bool by_encoder)
 {
     arm_t *a = &s_arm[id];
     move_dir_t dir = a->dir;
@@ -1802,14 +2043,19 @@ static void arm_complete(arm_id_t id, int64_t t)
     a->state = (dir == DIR_DEPLOY) ? ST_DEPLOYED : ST_STOWED;
     arm_learn_rate(id, t);                    /* first: raw counts moved this leg */
     char msg[80];
-    if (dir == DIR_DEPLOY) {
+    if (by_encoder) {
+        /* encoder end flag: position reached, switch not seen — no stroke
+         * learning / mismatch check (the count IS the reference here) */
+    } else if (dir == DIR_DEPLOY) {
         /* LS2: check, then (re)learn the stroke from the encoder */
         if (a->pos_valid && a->stroke_valid && (labs((long)(a->count - a->stroke)) > (long)MISMATCH_COUNTS)) {
             (void)snprintf(msg, sizeof msg, "ENCODER_MISMATCH: count %ld vs stroke %ld at LS2",
                            (long)a->count, (long)a->stroke);
             ev_arm(a->route, true, "warn", a->move_cmd, id, false, msg);
         }
-        if (a->pos_valid) {
+        if (a->pos_valid && a->stroke_fixed) {
+            /* stroke set by hand: kept (mismatch warned above) */
+        } else if (a->pos_valid) {
             if ((a->count > SWITCH_RELEASE_COUNTS) && (a->count <= MAX_STROKE_COUNTS)) {
                 a->stroke = a->count;
                 a->stroke_valid = true;
@@ -1830,13 +2076,15 @@ static void arm_complete(arm_id_t id, int64_t t)
         }
     }
     if (dir == DIR_STOW) { enc_zero(id); }    /* count = 0, pos_valid = 1   */
+    enc_flags_update(a);                      /* stroke may have been learned */
     a->idle_ref_count = a->count;             /* drift ref after re-reference */
     a->idle_seq++;
     a->f1 = 0U; a->f2 = 0U; a->time_used_ms = 0U;          /* limit reached */
     lock_align(id, a->route);                 /* lock at deploy, open at stow */
     nvs_save_arm(id);
     const char *up = (dir == DIR_DEPLOY) ? "DEPLOYED" : "STOWED";
-    ev_arm(a->route, true, (dir == DIR_DEPLOY) ? "deployed" : "stowed", a->move_cmd, id, true, up);
+    const char *emsg = (dir == DIR_DEPLOY) ? "DEPLOYED: encoder end, LS2 not seen" : "STOWED: encoder end, LS1 not seen";
+    ev_arm(a->route, true, (dir == DIR_DEPLOY) ? "deployed" : "stowed", a->move_cmd, id, true, by_encoder ? emsg : up);
 
     if (a->group_id != 0U) {
         a->group_done = true;
@@ -1884,10 +2132,10 @@ static bool safety_tripped(void)
  *   both closed         -> SWITCH_FAULT
  * Before any start: POSITION_CONFLICT if pos_valid and the count is past the
  * target end while the target switch is open (deploy: count > stroke +
- * max(10 %, 0.5 turn) with stroke_valid; stow: count < -0.5 turn). */
+ * max(10 %, ~5 cm) with stroke_valid; stow: count < -END_MARGIN_COUNTS). */
 /* Encoder says the arm is already past the end it would drive to, while
- * that end's switch is open (deploy: count > stroke + max(10 %, 0.5 turn)
- * with stroke_valid; stow: count < -0.5 turn). Checked before any start. */
+ * that end's switch is open (deploy: count > stroke + max(10 %, ~5 cm)
+ * with stroke_valid; stow: count < -END_MARGIN_COUNTS). Checked before any start. */
 static bool pos_conflict(const arm_t *a, move_dir_t dir)
 {
     if (!a->pos_valid) { return false; }
@@ -1902,8 +2150,8 @@ static decision_t decide_move(arm_id_t id, move_dir_t dir)
     const arm_t *a = &s_arm[id];
     const bool deploy    = (dir == DIR_DEPLOY);
     const bool own_flag  = deploy ? (a->f1 != 0U) : (a->f2 != 0U);
-    const bool ls_start  = deploy ? a->lim_stow   : a->lim_deploy;
-    const bool ls_target = deploy ? a->lim_deploy : a->lim_stow;
+    const bool ls_start  = deploy ? arm_at_stow(a)   : arm_at_deploy(a);   /* switch or encoder */
+    const bool ls_target = deploy ? arm_at_deploy(a) : arm_at_stow(a);
     decision_t d;
 
     if (own_flag)                        { d = DEC_START_CONT; }
@@ -1965,12 +2213,14 @@ static bool reject_if_busy(const cmd_t *c, arm_id_t id, move_dir_t dir)
 static void report_at_target(const cmd_t *c, arm_id_t id, move_dir_t dir)
 {
     arm_t *a = &s_arm[id];
+    /* re-reference the count only from a PHYSICAL switch; when only the
+     * encoder flag says "at the end", the count is already the reference */
     if (dir == DIR_DEPLOY) {
         a->state = ST_DEPLOYED;
-        apply_deploy_reference(id);
+        if (a->lim_deploy) { apply_deploy_reference(id); }
     } else {
         a->state = ST_STOWED;
-        enc_zero(id);
+        if (a->lim_stow) { enc_zero(id); }
     }
     a->f1 = 0U; a->f2 = 0U; a->time_used_ms = 0U;
     a->idle_ref_count = a->count;             /* drift ref after re-reference */
@@ -2066,7 +2316,7 @@ static void handle_start_cmd(const cmd_t *c, int64_t t)
             ev_arm(c->route, true, "fault", cmd, id, false, "SWITCH_FAULT: LS1 and LS2 both closed");
             continue;
         }
-        if ((dir == DIR_DEPLOY) ? a->lim_deploy : a->lim_stow) { report_at_target(c, id, dir); continue; }
+        if ((dir == DIR_DEPLOY) ? arm_at_deploy(a) : arm_at_stow(a)) { report_at_target(c, id, dir); continue; }
         if (pos_conflict(a, dir)) {
             ev_arm(c->route, true, "rejected", cmd, id, false,
                    (dir == DIR_DEPLOY) ? "POSITION_CONFLICT: count past stroke, LS2 open"
@@ -2145,6 +2395,80 @@ static void handle_cmd(const cmd_t *c, int64_t t)
         tx_post(c->route, false, t2, j2);
         break;
     }
+
+    case CMD_BENCH: {
+        /* Runtime bench mode. Only while both arms are idle; never saved
+         * (always OFF after a reboot); a SHUB_BENCH_TEST=1 build stays ON. */
+        const bool on = (c->value >= 0.5f);
+        const bool moving = arm_is_moving(&s_arm[ARM_PORT]) || arm_is_moving(&s_arm[ARM_STBD]);
+        const char *code;
+        char t2[TX_TEXT_MAX];
+        char j2[TX_JSON_MAX];
+        bool ok = false;
+        if (moving) {
+            code = "BUSY";
+            (void)snprintf(t2, sizeof t2, "BUSY: stop both arms before changing bench mode");
+        } else if (!on && (SHUB_BENCH_TEST != 0)) {
+            code = "BENCH_FORCED";
+            (void)snprintf(t2, sizeof t2, "BENCH_FORCED: firmware built with SHUB_BENCH_TEST=1");
+        } else {
+            atomic_store(&s_bench_rt, on);
+            ok = true;
+            code = "OK";
+            (void)snprintf(t2, sizeof t2, on ? "Ack: bench ON - encoder fault checks and encoder end-stops OFF"
+                                             : "Ack: bench OFF - normal operation");
+        }
+        (void)snprintf(j2, sizeof j2,
+                       "{\"evt\":\"%s\",\"cmd\":\"bench\",\"ok\":%s,\"code\":\"%s\",\"bench\":%d,\"msg\":\"%s\"}",
+                       ok ? "ack" : "rejected", ok ? "true" : "false", code, bench_active() ? 1 : 0, t2);
+        tx_post(c->route, !ok, t2, j2);
+        if (ok && on) {
+            tx_simple(ROUTE_AUTO, true, "warn", "BENCH_ON", "WARN BENCH ON: encoder fault checks OFF - not for use");
+        }
+        break;
+    }
+
+    case CMD_SET_STROKE:
+    case CMD_CLEAR_STROKE:
+        /* Deploy position (counts from LS1 = 0). set_stroke fixes it (LS2 no
+         * longer relearns it); clear_stroke forgets it -> learned at next LS2. */
+        for (uint32_t i = 0U; i < (uint32_t)ARM_COUNT; i++) {
+            arm_id_t id = (arm_id_t)i;
+            if (!side_includes(c->side, id)) { continue; }
+            arm_t *a = &s_arm[id];
+            const char *cmdn = CMD_NAME[c->type];
+            if (arm_is_moving(a)) {
+                ev_arm(c->route, true, "busy", cmdn, id, false, "BUSY: stop the arm first");
+                continue;
+            }
+            if (c->type == CMD_SET_STROKE) {
+                const float v = c->value;
+                if (!isfinite(v) || (v <= (float)SWITCH_RELEASE_COUNTS) || (v > (float)MAX_STROKE_COUNTS)) {
+                    char m[64];
+                    (void)snprintf(m, sizeof m, "STROKE_OUT_OF_RANGE: %d..%d counts",
+                                   SWITCH_RELEASE_COUNTS + 1, MAX_STROKE_COUNTS);
+                    ev_arm(c->route, true, "rejected", cmdn, id, false, m);
+                    continue;
+                }
+                a->stroke = (int32_t)lroundf(v);
+                a->stroke_valid = true;
+                a->stroke_fixed = true;
+            } else {
+                a->stroke = 0;
+                a->stroke_valid = false;
+                a->stroke_fixed = false;
+            }
+            enc_flags_update(a);
+            nvs_save_arm(id);
+            char m[64];
+            if (c->type == CMD_SET_STROKE) {
+                (void)snprintf(m, sizeof m, "Ack: stroke set to %ld counts (fixed)", (long)a->stroke);
+            } else {
+                (void)snprintf(m, sizeof m, "Ack: stroke cleared - learned at next LS2");
+            }
+            ev_arm(c->route, false, "ack", cmdn, id, true, m);
+        }
+        break;
 
     case CMD_TIMEOUT: {
         const float v = c->value;
@@ -2246,12 +2570,18 @@ static void arm_step(arm_id_t id, int64_t t)
             a->limit_hold = true;
         }
         if (a->lim_deploy && a->lim_stow) { arm_fault(id, FLT_BOTH_LIMITS, t); return; }
-        if (deb_target) { arm_complete(id, t); return; }
+        if (deb_target) { arm_complete(id, t, false); return; }
         if (!raw_target) {
             a->limit_hold = false;               /* bounce: resume normally */
         } else {
             return;                              /* hold PWM 0, check next tick */
         }
+    } else if (!bench_active() &&
+               ((a->dir == DIR_DEPLOY) ? (a->enc_deploy && !a->lim_stow) : (a->enc_stow && !a->lim_deploy))) {
+        arm_complete(id, t, true);               /* encoder end flag: switch not seen */
+        return;
+    } else {
+        /* not at the target */
     }
 
     /* window: start-with-time -> stop like X; otherwise -> TIMEOUT fault */
@@ -2264,7 +2594,7 @@ static void arm_step(arm_id_t id, int64_t t)
     /* STALL / WRONG_DIR / OVERTRAVEL / SWITCH_STUCK / WRONG_LIMIT /
      * BOTH_LIMITS run in status_task on the snapshot (REQ_FAULT). */
 
-    /* approach slow-down: last max(10 % stroke, 1 turn) -> cap 25 % duty.
+    /* approach slow-down: last max(10 % stroke, ~5 cm) -> cap 25 % duty.
      * Forward needs stroke_valid, reverse needs pos_valid. */
     a->target_duty = arm_speed(a) * 100.0f;
     const int32_t rem = remaining_counts(a, a->dir);
@@ -2308,9 +2638,10 @@ static void read_inputs(void)
         debounce(a->raw_deploy, &a->lim_deploy, &a->deb_cnt_deploy);
         debounce(a->raw_stow,   &a->lim_stow,   &a->deb_cnt_stow);
         int cur = hal_enc_read(id);
-        int delta = cur - a->pcnt_prev;          /* accum_count: full int range */
-        a->pcnt_prev = cur;
+        int delta = cur - a->enc_prev;          /* accum_count: full int range */
+        a->enc_prev = cur;
         a->count += (int32_t)delta * ARM_HW[id].enc_sign;
+        enc_flags_update(a);
     }
 }
 
@@ -2337,7 +2668,7 @@ static void handle_req(const req_t *r, int64_t t)
         }
         break;
     case REQ_POSITION_LOST:
-        if (((a->state == ST_STOWED) && !a->lim_stow) || ((a->state == ST_DEPLOYED) && !a->lim_deploy)) {
+        if (((a->state == ST_STOWED) && !arm_at_stow(a)) || ((a->state == ST_DEPLOYED) && !arm_at_deploy(a))) {
             a->state = (a->f1 || a->f2) ? ST_STOPPED : ST_UNKNOWN;   /* pos_valid kept */
             nvs_save_arm(id);
         }
@@ -2673,6 +3004,19 @@ static int parse_json_cmd(const char *line, cmd_t out[2])
             const json_pair_t *val = json_find(pairs, np, "value");
             if ((val == NULL) || (val->type != JV_NUM) || !clamp_speed(val->num, &c.value)) { return 0; }
             c.type = CMD_SPEED;
+        } else if (strcmp(cmd->str, "set_stroke") == 0) {
+            const json_pair_t *val = json_find(pairs, np, "value");
+            if ((val == NULL) || (val->type != JV_NUM) || !isfinite(val->num)) { return 0; }
+            c.type = CMD_SET_STROKE;
+            c.value = val->num;               /* range-checked in motion */
+        } else if (strcmp(cmd->str, "clear_stroke") == 0) {
+            c.type = CMD_CLEAR_STROKE;
+        } else if (strcmp(cmd->str, "bench") == 0) {
+            const json_pair_t *val = json_find(pairs, np, "value");
+            if ((val == NULL) || ((val->type != JV_NUM) && (val->type != JV_BOOL)) ||
+                ((val->num != 0.0f) && (val->num != 1.0f))) { return 0; }
+            c.type = CMD_BENCH;
+            c.value = val->num;               /* 1 = on, 0 = off (true/false too) */
         } else if (strcmp(cmd->str, "set_timeout") == 0) {
             const json_pair_t *val = json_find(pairs, np, "value");
             if ((val == NULL) || (val->type != JV_NUM) || !isfinite(val->num)) { return 0; }
@@ -2684,7 +3028,7 @@ static int parse_json_cmd(const char *line, cmd_t out[2])
         cmd_t c = CMD_INIT;
         c.route = ROUTE_JSON;
         if      (strcmp(legacy->str, "Deploy") == 0)  { c.type = CMD_DEPLOY; }
-        else if (strcmp(legacy->str, "Retract") == 0) { c.type = CMD_STOW; }
+        else if (strcmp(legacy->str, "Stow") == 0)    { c.type = CMD_STOW; }   /* both arms */
         else if (strcmp(legacy->str, "Pause") == 0)   { c.type = CMD_STOP; }  /* no pause: halts */
         else { return 0; }
         out[n++] = c;
@@ -2704,13 +3048,31 @@ static int parse_letter_cmd(const char *line, cmd_t *out)
     char c0 = (char)toupper((unsigned char)line[0]);
     cmd_t c = CMD_INIT;
 
-    if ((c0 == 'D') || (c0 == 'S') || (c0 == 'X') || (c0 == 'R') || (c0 == 'L') || (c0 == 'U')) {
+    if ((c0 == 'D') || (c0 == 'S') || (c0 == 'X') || (c0 == 'R') || (c0 == 'L') || (c0 == 'U') || (c0 == 'C')) {
         c.type = (c0 == 'D') ? CMD_DEPLOY : (c0 == 'S') ? CMD_STOW : (c0 == 'X') ? CMD_STOP :
-                 (c0 == 'R') ? CMD_RESET  : (c0 == 'L') ? CMD_LOCK : CMD_UNLOCK;
+                 (c0 == 'R') ? CMD_RESET  : (c0 == 'L') ? CMD_LOCK : (c0 == 'U') ? CMD_UNLOCK :
+                 CMD_CLEAR_STROKE;
         if (len == 1U)                         { c.side = SIDE_BOTH; }
         else if ((len == 2U) && (line[1] == '1')) { c.side = SIDE_PORT; }
         else if ((len == 2U) && (line[1] == '2')) { c.side = SIDE_STBD; }
         else { return 0; }
+    } else if (c0 == 'B') {
+        /* B1 = bench ON, B0 = bench OFF (here 1/0 mean on/off, not a side) */
+        if ((len != 2U) || ((line[1] != '1') && (line[1] != '0'))) { return 0; }
+        c.type = CMD_BENCH;
+        c.value = (line[1] == '1') ? 1.0f : 0.0f;
+    } else if (c0 == 'K') {
+        /* K<1|2>,<counts>  set the deploy position by hand (K,<n> = both) */
+        size_t k = 1U;
+        c.type = CMD_SET_STROKE;
+        if (line[k] == '1')      { c.side = SIDE_PORT; k++; }
+        else if (line[k] == '2') { c.side = SIDE_STBD; k++; }
+        else                     { c.side = SIDE_BOTH; }
+        if (line[k] != ',') { return 0; }
+        char *end = NULL;
+        const long n = strtol(&line[k + 1U], &end, 10);
+        if ((end == NULL) || (end == &line[k + 1U]) || (*end != '\0')) { return 0; }
+        c.value = (float)n;                   /* range-checked in motion */
     } else if (c0 == 'G') {
         /* G, G1, G2 [+ optional D|S, ,<sec>, ,<speed %>] */
         size_t k = 1U;
@@ -2948,6 +3310,8 @@ static void health_report(void)
             ESP_LOGD(TAG, "stack %s %lu B free", names[i], (unsigned long)free_b);
         }
     }
+    ESP_LOGD(TAG, "encoder isr: port %lu stbd %lu", (unsigned long)hal_enc_isr_count(ARM_PORT),
+             (unsigned long)hal_enc_isr_count(ARM_STBD));
     ESP_LOGI(TAG, "health: evt_q %u/%u used, txdrop %lu",
              (unsigned)uxQueueMessagesWaiting(s_evt_q), (unsigned)EVT_QUEUE_LEN,
              (unsigned long)atomic_load(&s_tx_drop));
@@ -2978,7 +3342,7 @@ static int32_t snap_fwd_overtravel_limit(const arm_snap_t *s)
 {
     const int32_t st = s->stroke_valid ? s->stroke : MAX_STROKE_COUNTS;
     int32_t m = st / 10;
-    if (m < HALF_TURN_COUNTS) { m = HALF_TURN_COUNTS; }
+    if (m < END_MARGIN_COUNTS) { m = END_MARGIN_COUNTS; }
     return st + m;
 }
 
@@ -2989,14 +3353,17 @@ static int32_t snap_fwd_overtravel_limit(const arm_snap_t *s)
 static fault_t mon_check(mon_t *m, const arm_snap_t *s, int64_t t)
 {
     const bool deploy    = (s->dir == DIR_DEPLOY);
-    const bool deb_start = deploy ? s->ls1 : s->ls2;
+    const bool encok = !bench_active();                 /* bench: switches only */
+    const bool at1 = s->ls1 || (encok && s->enc1 && !s->ls2);   /* switch or encoder */
+    const bool at2 = s->ls2 || (encok && s->enc2 && !s->ls1);
+    const bool deb_start = deploy ? at1 : at2;
     const int32_t travel = (s->count - s->start_count) * (deploy ? 1 : -1);
 
     if (s->ls1 && s->ls2) { return FLT_BOTH_LIMITS; }
     if (!m->start_released && !deb_start) { m->start_released = true; }
     if (m->start_released && s->start_was_pressed && deb_start) { return FLT_WRONG_LIMIT; }
     if (!s->start_was_pressed && deb_start)                     { return FLT_WRONG_LIMIT; }
-    if (SHUB_BENCH_TEST) { return FLT_NONE; }
+    if (bench_active()) { return FLT_NONE; }
 
     if (!m->start_released && (travel > SWITCH_RELEASE_COUNTS)) { return FLT_SWITCH_STUCK; }
 
@@ -3021,7 +3388,7 @@ static fault_t mon_check(mon_t *m, const arm_snap_t *s, int64_t t)
     if (travel < -WRONG_DIR_COUNTS) { return FLT_WRONG_DIR; }
     if (s->pos_valid) {
         if (deploy && (s->count > snap_fwd_overtravel_limit(s))) { return FLT_OVERTRAVEL; }
-        if (!deploy && (s->count < -HALF_TURN_COUNTS))           { return FLT_OVERTRAVEL; }
+        if (!deploy && (s->count < -END_MARGIN_COUNTS))           { return FLT_OVERTRAVEL; }
     } else if (travel > MAX_STROKE_COUNTS) {
         return FLT_OVERTRAVEL;
     }
@@ -3095,7 +3462,10 @@ static void status_task(void *pv)
             }
 
             /* ---- idle: POSITION_LOST (switch released at rest) ---- */
-            const bool lost = ((s->state == ST_STOWED) && !s->ls1) || ((s->state == ST_DEPLOYED) && !s->ls2);
+            const bool encok = !bench_active();
+            const bool at1 = s->ls1 || (encok && s->enc1 && !s->ls2);
+            const bool at2 = s->ls2 || (encok && s->enc2 && !s->ls1);
+            const bool lost = ((s->state == ST_STOWED) && !at1) || ((s->state == ST_DEPLOYED) && !at2);
             if (lost && !m->lost_sent) {
                 m->lost_sent = true;
                 ev_arm_snap(ROUTE_AUTO, true, "position_lost", "none", id, s, false, "POSITION_LOST");
@@ -3105,7 +3475,7 @@ static void status_task(void *pv)
             }
 
             /* ---- idle: POSITION_UNKNOWN (both open, no f1/f2, no position) ---- */
-            const bool unknown = (s->state != ST_FAULT) && !s->ls1 && !s->ls2 &&
+            const bool unknown = (s->state != ST_FAULT) && !at1 && !at2 &&
                                  (s->f1 == 0U) && (s->f2 == 0U) && !s->pos_valid;
             if (unknown && !m->unk_warned) {
                 ev_arm_snap(ROUTE_AUTO, true, "warn", "none", id, s, false,
@@ -3215,6 +3585,7 @@ static void boot_load_nvs(void)
             a->count         = r.count;
             a->stroke        = r.stroke;
             a->stroke_valid  = (r.stroke_valid != 0U);
+            a->stroke_fixed  = (r.stroke_fixed != 0U);
             a->rate_cps      = r.rate_cps;
             a->stop_time_ms  = r.stop_time_ms;
             a->dist_restored = true;
@@ -3311,8 +3682,8 @@ void app_main(void)
     boot_read_limits();
     for (uint32_t i = 0U; i < (uint32_t)ARM_COUNT; i++) {
         arm_id_t id = (arm_id_t)i;
-        (void)hal_enc_read(id);          /* fresh PCNT after init is 0 */
-        s_arm[i].pcnt_prev = 0;
+        (void)hal_enc_read(id);          /* fresh decoder after init is 0 */
+        s_arm[i].enc_prev = 0;
         boot_classify(id, s_rec_saved_ok[i], s_rec_saved_ok[i] && (s_rec_saved[i].pos_valid != 0U));
         s_arm[i].idle_ref_count = s_arm[i].count;
         s_arm[i].idle_seq = 1U;          /* #5: status DRIFT check live from boot */
