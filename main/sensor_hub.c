@@ -43,6 +43,10 @@
  *                      OVERTRAVEL / SWITCH_STUCK and encoder end-stops OFF,
  *                      counting + deploy-position learning stay ON
  *     ?                status (per arm + sys line with raw switch pins)
+ *   Host link [COMMS-RX-WDT]: the topside must send at least one valid
+ *     message on UART1 every 10 s (recommended: {"cmd":"ping"} every 2-5 s,
+ *     answered with {"cmd":"pong"}), or after 20-30 s both arms auto-stow
+ *     to LS1 and latch (R to clear once comms are back) [COMMS-STOW].
  *   JSON examples:
  *     {"cmd":"deploy","side":"port"}   {"cmd":"stow"}   {"cmd":"stop"}
  *     {"cmd":"start","side":"port","direction":"forward","time":10,"speed":0.4}
@@ -123,6 +127,34 @@
  *   strapping pin — they work, but see the pin-map notes.
  *
  * COMMS-LOSS POLICY                                          [SOP §6 / C]
+ *   [COMMS-RX-WDT] Host link watchdog on UART1 (GPIO17 TX / GPIO18 RX, the
+ *   UART-to-Ethernet converter): the HOST sends; the board watches. Any
+ *   UART1 line that parses as a command (incl. ping / pong and commands
+ *   refused later) is a valid message; garbage, noise and "Unknown command"
+ *   are not, and USB-console (UART0) lines never count. Every 10 s window
+ *   with no valid message is a miss ("COMMS no rx n/3"); a valid message
+ *   resets the count. A host {"cmd":"ping"} is answered {"cmd":"pong"}.
+ *   A miss counts only after the first message since boot; 3 misses in a row
+ *   -> latched COMMS FAULT. [COMMS-STOW] Safe state = controlled stow: every
+ *   arm not on LS1 and not in another fault (incl. one the trip just
+ *   stopped) unlocks, stows at the saved default speed (min 0.15) with all
+ *   stow checks + LS1 search, event failsafe COMMS_STOW; only this auto-stow
+ *   may drive (stow direction) while the fault is latched. At LS1, or if
+ *   it stops / faults, the arm latches FAULT / COMMS (another fault, e.g.
+ *   STALL / LS1_NOT_FOUND, keeps its own). X stops the auto-stow (arm then
+ *   FAULT / COMMS where it is). A safety trip still stops everything. Arms
+ *   already in another fault do not move. deploy / stow / start / lock /
+ *   unlock / set_speed rejected (COMMS_FAULT); stop, status, reset, config
+ *   allowed; R is refused (BUSY) until the auto-stow has ended.
+ *   A valid message logs "comms restored, fault still latched".
+ *   Cleared only by R / {"cmd":"reset"} after a valid message since the fault
+ *   (else RESET_DENIED COMMS_NOT_RESTORED), or by a reboot; then idle, no
+ *   auto-resume. Not stored in NVS. Before the first message since boot,
+ *   motion commands are rejected (COMMS_NOT_READY) unless bench mode is on.
+ *   Constants: COMMS_CHECK_INTERVAL_MS / COMMS_MAX_FAILS. Flags:
+ *   COMMS_TEST_SELF_HEARTBEAT (1 = bench, never faults; keep 0 in service),
+ *   COMMS_DEVICE_PING_ENABLE (1 = board also sends a ping each window).
+ *   Previous policy (still true for each move):
  *   Every move self-terminates (limit / time / timeout / fault), so silence
  *   from the host is NOT a fault. The controller sends STATUS every 5 s.
  *
@@ -208,9 +240,21 @@
  *   enc2 (at deploy) on at count >= stroke, off 20 counts below the stroke
  *   Valid only with a known position (enc2 also needs the learned stroke).
  *   Everywhere a limit switch is used, "at stow" = LS1 OR enc1 and "at
- *   deploy" = LS2 OR enc2: stopping a move, deploy / stow / start
- *   decisions, ALREADY_*, reset, boot, POSITION_LOST / UNKNOWN, WRONG_LIMIT,
- *   SWITCH_STUCK. A closed physical switch wins over the other end's
+ *   deploy" = LS2 OR enc2: stopping a deploy, deploy / start decisions,
+ *   ALREADY_DEPLOYED, reset, boot, POSITION_LOST / UNKNOWN, WRONG_LIMIT,
+ *   SWITCH_STUCK. [STOW-LS1] EXCEPTION — a stow ends ONLY on the physical
+ *   LS1: at enc1 with LS1 open it goes on at 25 % duty (warn LS1_SEARCH)
+ *   for up to STOW_LS1_SEARCH_MS (5 s, STALL still active, reverse
+ *   OVERTRAVEL off) -> LS1 = normal completion, count = 0; not found ->
+ *   FAULT LS1_NOT_FOUND (motor off, count not zeroed). stow / start-reverse
+ *   answer ALREADY_STOWED only with LS1 closed, never POSITION_CONFLICT.
+ *   [LS-REF] LS1 pressed = count 0, saved to NVS: at stow completion, at
+ *   boot, and for every idle arm on LS1 (first idle tick, each new press,
+ *   drift > ~1.3 cm; mismatch > ~2.7 cm warned); an idle arm on LS1 is
+ *   STOWED with f1 = f2 = 0 (FAULT kept). With LS1 pressed a stow / start
+ *   reverse / comms auto-stow never drives (ALREADY_STOWED, also with f2).
+ *   Deploy: the encoder ends it only at stroke + 20 counts (~2.7 cm) with
+ *   LS2 not seen, so LS2 normally ends every deploy (and relearns stroke). A closed physical switch wins over the other end's
  *   encoder flag. BOTH_LIMITS stays a physical-switch fault. The switch is
  *   checked first; a move ended by the encoder reports "...: encoder end,
  *   LSx not seen" and is otherwise identical (lock at deploy, NVS, events).
@@ -290,6 +334,18 @@
  *                                           no move (also cancels a start)
  *               SAFETY_TRIP                 trip during the lock / rest wait:
  *                                           start cancelled, send R
+ *               COMMS_FAULT / COMMS_NOT_READY  [COMMS-WDT] motion / actuation
+ *                                           refused: host link fault latched
+ *                                           / no host message since boot
+ *               COMMS_RESTORED              [COMMS-RX-WDT] host message after a fault;
+ *                                           still latched until R
+ *     reset_denied COMMS_NOT_RESTORED       [COMMS-WDT] R before comms returned
+ *     fault     fault=COMMS                 [COMMS-WDT] host link lost (latched)
+ *     failsafe  COMMS_STOW                  [COMMS-STOW] auto-stow started
+ *     reset_denied BUSY                     [COMMS-STOW] R during the auto-stow
+ *     warn      LS1_SEARCH                  [STOW-LS1] encoder at 0, LS1 open
+ *   HOST LINK (UART1): host must send a valid message at least every 10 s;
+ *     {"cmd":"ping"} -> {"cmd":"pong"} ([COMMS-RX-WDT], see COMMS-LOSS POLICY).
  *               WINDOW_SHORT                ETA > window (move still runs)
  *               ENCODER_MISMATCH            count off by > ~2.7 cm at LS1
  *                                           (0) or LS2 (stroke)
@@ -304,7 +360,7 @@
  *     stopped   OK ("Ack: Stopped") / TIME_ELAPSED
  *     fault     FAULT / SWITCH_FAULT / SERVO_ERR   (fault= gives the reason:
  *               BOTH_LIMITS WRONG_LIMIT SWITCH_STUCK STALL WRONG_DIR
- *               OVERTRAVEL TIMEOUT SAFETY)
+ *               OVERTRAVEL TIMEOUT SAFETY COMMS LS1_NOT_FOUND)
  *     locked / unlocked   LOCKED / UNLOCKED
  *     lock_denied LOCK_DENIED  unlock_denied UNLOCK_DENIED
  *     reset_denied RESET_DENIED (both switches closed)
@@ -460,6 +516,19 @@ static const arm_hw_t ARM_HW[ARM_COUNT] = {
 /* =============================================================================
  * Tunables
  * ========================================================================== */
+// [COMMS-RX-WDT] begin — host link watchdog (UART1 = GPIO17 TX / GPIO18 RX)
+/* Any valid message received from the host on UART1 within a check window
+ * passes that window; COMMS_MAX_FAILS empty windows in a row -> COMMS FAULT. */
+#define COMMS_TEST_SELF_HEARTBEAT 0         /* 1 = bench test without host: every window passes */
+#define COMMS_DEVICE_PING_ENABLE  0         /* 1 = also send {"cmd":"ping"} each window (no pong wait) */
+#define COMMS_CHECK_INTERVAL_MS   10000U    /* check window                       */
+#define COMMS_MAX_FAILS           3U        /* empty windows in a row -> COMMS FAULT */
+_Static_assert(COMMS_CHECK_INTERVAL_MS >= 1000U, "check window too short for a host link");
+_Static_assert(COMMS_MAX_FAILS >= 1U, "need at least one failed window before a fault");
+_Static_assert((COMMS_TEST_SELF_HEARTBEAT == 0) || (COMMS_TEST_SELF_HEARTBEAT == 1), "flag is 0 or 1");
+_Static_assert((COMMS_DEVICE_PING_ENABLE == 0) || (COMMS_DEVICE_PING_ENABLE == 1), "flag is 0 or 1");
+// [COMMS-RX-WDT] end
+
 #define CONTROL_PERIOD_MS       10U
 #define DEBOUNCE_SAMPLES        5U          /* 5 x 10 ms = 50 ms (old firmware) */
 #define RAMP_TIME_MS            300U        /* 0 -> 100 % duty                  */
@@ -520,6 +589,13 @@ static const arm_hw_t ARM_HW[ARM_COUNT] = {
 #define SHUB_BENCH_TEST         0
 #endif
 #define MIN_SPEED               0.15f
+// [STOW-LS1] begin
+#define STOW_LS1_SEARCH_MS      5000U       /* encoder at stow, LS1 open: keep stowing slowly up to 5 s */
+// [STOW-LS1] end
+// [LS-REF] begin
+#define DEPLOY_ENC_END_MARGIN_COUNTS 20     /* ~2.7 cm: encoder ends a deploy only this far past the stroke, so LS2 ends it normally */
+_Static_assert(DEPLOY_ENC_END_MARGIN_COUNTS < END_MARGIN_COUNTS, "encoder deploy end must stay inside the overtravel margin");
+// [LS-REF] end
 #define DEFAULT_SPEED           0.50f
 #define SPEED_SAVE_EPS          0.005f
 #define PROGRESS_PERIOD_MS      500U
@@ -614,7 +690,10 @@ typedef enum { DIR_NONE = 0, DIR_DEPLOY, DIR_STOW } move_dir_t;
 
 typedef enum {
     FLT_NONE = 0, FLT_BOTH_LIMITS, FLT_WRONG_LIMIT, FLT_SWITCH_STUCK,
-    FLT_STALL, FLT_WRONG_DIR, FLT_OVERTRAVEL, FLT_TIMEOUT, FLT_SAFETY, FLT__COUNT
+    FLT_STALL, FLT_WRONG_DIR, FLT_OVERTRAVEL, FLT_TIMEOUT, FLT_SAFETY,
+    FLT_COMMS,                                  /* [COMMS-WDT] host link lost (latched) */
+    FLT_LS1_NOT_FOUND,                          /* [STOW-LS1] LS1 not reached within the search */
+    FLT__COUNT
 } fault_t;
 
 typedef enum { LOCK_UNKNOWN = 0, LOCK_LOCKED, LOCK_UNLOCKED, LOCK_LOCKING, LOCK_UNLOCKING, LOCK__COUNT } lock_state_t;
@@ -634,7 +713,10 @@ typedef struct {
 typedef enum {
     CMD_DEPLOY = 0, CMD_STOW, CMD_START, CMD_STOP, CMD_RESET,
     CMD_LOCK, CMD_UNLOCK, CMD_SPEED, CMD_TIMEOUT, CMD_STATUS,
-    CMD_SET_STROKE, CMD_CLEAR_STROKE, CMD_BENCH, CMD__COUNT
+    CMD_SET_STROKE, CMD_CLEAR_STROKE, CMD_BENCH,
+    CMD_PONG,                                   /* [COMMS-WDT] host reply to ping */
+    CMD_PING,                                   /* [COMMS-RX-WDT] host ping -> pong */
+    CMD__COUNT
 } cmd_type_t;
 
 typedef enum { SIDE_BOTH = 0, SIDE_PORT, SIDE_STBD } side_t;
@@ -644,6 +726,7 @@ typedef enum {
     ROUTE_TEXT = 0,   /* text line on UART0 + UART1                           */
     ROUTE_JSON,       /* JSON line on UART0 + UART1                           */
     ROUTE_AUTO,       /* text on UART0, JSON on UART1                         */
+    ROUTE_SYS_JSON,   /* [COMMS-WDT] JSON on UART1 only (ping / pong)         */
 } route_t;
 
 typedef struct {
@@ -732,6 +815,18 @@ typedef struct {
     /* 'both' group completion */
     uint32_t group_id;
     bool     group_done;
+
+    // [STOW-LS1] begin
+    bool     ls1_search;                   /* stow: encoder at 0, LS1 not yet seen */
+    int64_t  ls1_search_us;                /* search start                    */
+    bool     lim_stow_prev;                /* LS1 last tick (idle zero on close) */
+    // [STOW-LS1] end
+    // [LS-REF] begin
+    bool     ls1_ref_done;                 /* idle on LS1: count referenced to 0 */
+    // [LS-REF] end
+    // [COMMS-STOW] begin
+    bool     comms_stow;                   /* this move is the comms-loss auto-stow */
+    // [COMMS-STOW] end
 } arm_t;
 
 /* Read-only copy of an arm, published by motion for the other tasks. */
@@ -765,6 +860,7 @@ typedef struct {
     uint32_t     window_ms;             /* window of this leg                */
     int32_t      eta_ms;                /* live ETA, -1 = unknown            */
     float        duty;
+    bool         ls1_search;            /* [STOW-LS1] stow searching for LS1 */
 } arm_snap_t;
 
 typedef struct {
@@ -823,6 +919,19 @@ static bool         s_nvs_ok;
 static _Atomic uint32_t s_timeout_s = MOVE_TIMEOUT_DEFAULT_S;  /* motion writes  */
 static _Atomic uint32_t s_trip;                     /* trip_t: safety sets, reset clears */
 static _Atomic bool     s_bench_rt;                 /* runtime bench mode (B1/B0); OFF at boot */
+// [COMMS-WDT] begin
+/* Host link state, one atomic so "check + change" is a single CAS:
+ *   OK         no fault
+ *   FAULT      latched, comms still down
+ *   RESTORED   latched, a valid host message since the fault -> R may clear it */
+typedef enum { COMMS_OK = 0, COMMS_FAULT_DOWN, COMMS_FAULT_RESTORED } comms_state_t;
+static _Atomic uint32_t s_comms_state = COMMS_OK;   /* status sets, reset clears (CAS) */
+static _Atomic uint32_t s_comms_fails;              /* consecutive empty windows       */
+static _Atomic bool     s_comms_first_ok;           /* a valid UART1 message since boot */
+// [COMMS-RX-WDT] begin
+static _Atomic bool     s_comms_rx;                 /* cmd_task: valid UART1 message in this window */
+// [COMMS-RX-WDT] end
+// [COMMS-WDT] end
 static _Atomic bool     s_pwm_detached;             /* PWM pins forced to GPIO: reboot   */
 static _Atomic uint32_t s_motion_beat;              /* motion: +1 per tick               */
 static _Atomic uint32_t s_status_beat;              /* status: +1 per loop               */
@@ -862,11 +971,15 @@ static const char *const STATE_NAME[ST__COUNT] = {
 };
 static const char *const CMD_NAME[CMD__COUNT] = {
     "deploy", "stow", "start", "stop", "reset", "lock", "unlock", "set_speed", "set_timeout", "status",
-    "set_stroke", "clear_stroke", "bench"
+    "set_stroke", "clear_stroke", "bench",
+    "pong",                                     /* [COMMS-WDT] */
+    "ping"                                      /* [COMMS-RX-WDT] */
 };
 static const char *const FAULT_NAME[FLT__COUNT] = {
     "NONE", "BOTH_LIMITS", "WRONG_LIMIT", "SWITCH_STUCK",
-    "STALL", "WRONG_DIR", "OVERTRAVEL", "TIMEOUT", "SAFETY"
+    "STALL", "WRONG_DIR", "OVERTRAVEL", "TIMEOUT", "SAFETY",
+    "COMMS",                                    /* [COMMS-WDT] */
+    "LS1_NOT_FOUND"                             /* [STOW-LS1] */
 };
 static const char *const LOCK_NAME[LOCK__COUNT] = {
     "UNKNOWN", "LOCKED", "UNLOCKED", "LOCKING", "UNLOCKING"
@@ -1644,6 +1757,7 @@ static void snap_fill(arm_id_t id, arm_snap_t *s, int64_t t)
     s->window_ms  = a->window_ms;
     s->eta_ms     = arm_is_moving(a) ? arm_eta_ms(a, a->dir, arm_speed(a)) : -1;
     s->duty       = a->duty;
+    s->ls1_search = a->ls1_search;      /* [STOW-LS1] */
 }
 
 static void ev_arm(route_t route, bool critical, const char *evt, const char *cmd,
@@ -1683,8 +1797,11 @@ static void motor_out(arm_id_t id, float duty, move_dir_t dir)
         hal_force_pwm_pins_low_gpio();          /* cannot happen; fail safe   */
         halt_safe("motor mutex");
     }
-    (void)dir;
-    if (atomic_load(&s_trip) != (uint32_t)TRIP_NONE) { duty = 0.0f; }   /* trip: all off */
+    // [COMMS-STOW] begin — comms fault: only the auto-stow may drive, stow direction only
+    const bool comms_drive_ok = (atomic_load(&s_comms_state) == (uint32_t)COMMS_OK) ||
+                                (s_arm[id].comms_stow && (dir == DIR_STOW));
+    if ((atomic_load(&s_trip) != (uint32_t)TRIP_NONE) || !comms_drive_ok) { duty = 0.0f; }   /* trip / comms fault: off */
+    // [COMMS-STOW] end
     hal_motor_write(id, duty);
     (void)xSemaphoreGive(s_motor_mtx);
 }
@@ -1859,6 +1976,8 @@ static void arm_stop_output(arm_id_t id, int64_t t)
     a->duty = 0.0f;
     a->target_duty = 0.0f;
     a->limit_hold = false;
+    a->ls1_search = false;           /* [STOW-LS1] */
+    a->comms_stow = false;           /* [COMMS-STOW] any end of the move ends the auto-stow */
     motor_out(id, 0.0f, DIR_NONE);   /* immediate, do not wait for end of tick */
     if (was_driving) {               /* new drift reference only after a drive */
         a->idle_ref_count = a->count;
@@ -1938,6 +2057,7 @@ static void arm_begin_drive(arm_id_t id, int64_t t)
     a->duty             = 0.0f;
     a->target_duty      = 0.0f;               /* set every tick by arm_step */
     a->limit_hold       = false;
+    a->ls1_search       = false;              /* [STOW-LS1] */
     a->move_start_us    = t;
     a->start_count      = a->count;
     a->start_switch_was_pressed = (a->dir == DIR_DEPLOY) ? arm_at_stow(a) : arm_at_deploy(a);
@@ -2119,8 +2239,19 @@ typedef enum {
 /* Safety-task trip (global): stops all motion until reset. */
 static bool safety_tripped(void)
 {
-    return atomic_load(&s_trip) != (uint32_t)TRIP_NONE;
+    return (atomic_load(&s_trip) != (uint32_t)TRIP_NONE) ||
+           (atomic_load(&s_comms_state) != (uint32_t)COMMS_OK);      /* [COMMS-WDT] */
 }
+
+// [COMMS-STOW] begin
+/* Per arm: a safety trip always stops it; a comms fault stops it unless
+ * this move is the comms-loss auto-stow. */
+static bool arm_tripped(const arm_t *a)
+{
+    return (atomic_load(&s_trip) != (uint32_t)TRIP_NONE) ||
+           ((atomic_load(&s_comms_state) != (uint32_t)COMMS_OK) && !a->comms_stow);
+}
+// [COMMS-STOW] end
 
 /* Deploy (dir = DIR_DEPLOY):            Stow (DIR_STOW) mirrors it:
  *   f1 == 1             -> start cont.    f2 == 1             -> start cont.
@@ -2142,7 +2273,10 @@ static bool pos_conflict(const arm_t *a, move_dir_t dir)
     if (dir == DIR_DEPLOY) {
         return a->stroke_valid && !a->lim_deploy && (a->count > fwd_overtravel_limit(a));
     }
-    return !a->lim_stow && (a->count < -STOW_CONFLICT_COUNTS);
+    // [STOW-LS1] begin — stow drives on until LS1 (slow, max STOW_LS1_SEARCH_MS,
+    // STALL protected), so a count behind 0 is no longer a reason to refuse it
+    return false;
+    // [STOW-LS1] end
 }
 
 static decision_t decide_move(arm_id_t id, move_dir_t dir)
@@ -2151,9 +2285,13 @@ static decision_t decide_move(arm_id_t id, move_dir_t dir)
     const bool deploy    = (dir == DIR_DEPLOY);
     const bool own_flag  = deploy ? (a->f1 != 0U) : (a->f2 != 0U);
     const bool ls_start  = deploy ? arm_at_stow(a)   : arm_at_deploy(a);   /* switch or encoder */
-    const bool ls_target = deploy ? arm_at_deploy(a) : arm_at_stow(a);
+    const bool ls_target = deploy ? arm_at_deploy(a) : a->lim_stow;     /* [STOW-LS1] stow: switch only */
     decision_t d;
 
+    // [LS-REF] begin — LS1 pressed (switch, not encoder): already stowed, a stow
+    // never drives again, even with f2 set
+    if (!deploy && a->lim_stow && !a->lim_deploy) { return DEC_AT_TARGET; }
+    // [LS-REF] end
     if (own_flag)                        { d = DEC_START_CONT; }
     else if (a->servo_err)               { return DEC_LOCK_NOT_OPEN; }
     else if (ls_start && !ls_target)     { d = DEC_START_FRESH; }
@@ -2316,7 +2454,7 @@ static void handle_start_cmd(const cmd_t *c, int64_t t)
             ev_arm(c->route, true, "fault", cmd, id, false, "SWITCH_FAULT: LS1 and LS2 both closed");
             continue;
         }
-        if ((dir == DIR_DEPLOY) ? arm_at_deploy(a) : arm_at_stow(a)) { report_at_target(c, id, dir); continue; }
+        if ((dir == DIR_DEPLOY) ? arm_at_deploy(a) : a->lim_stow) { report_at_target(c, id, dir); continue; }   /* [STOW-LS1] */
         if (pos_conflict(a, dir)) {
             ev_arm(c->route, true, "rejected", cmd, id, false,
                    (dir == DIR_DEPLOY) ? "POSITION_CONFLICT: count past stroke, LS2 open"
@@ -2337,8 +2475,101 @@ static void handle_start_cmd(const cmd_t *c, int64_t t)
     mark_group(accepted);
 }
 
+// [COMMS-WDT] begin
+/* Motion / actuation commands: refused while the comms fault is latched, and
+ * before the first host message since boot (except in bench mode). stop,
+ * status, reset and configuration commands are never refused here. */
+static bool comms_refuse(const cmd_t *c)
+{
+    const bool actuation = (c->type == CMD_DEPLOY) || (c->type == CMD_STOW) || (c->type == CMD_START) ||
+                           (c->type == CMD_LOCK) || (c->type == CMD_UNLOCK) || (c->type == CMD_SPEED);
+    if (!actuation) { return false; }
+    const char *code = NULL;
+    const char *why = NULL;
+    if (atomic_load(&s_comms_state) != (uint32_t)COMMS_OK) {
+        code = "COMMS_FAULT";
+        why  = "COMMS_FAULT: host link lost - restore comms, then send R";
+    } else if (!atomic_load(&s_comms_first_ok) && !bench_active()) {
+        code = "COMMS_NOT_READY";
+        why  = "COMMS_NOT_READY: no host message since boot";    /* [COMMS-RX-WDT] */
+    } else {
+        return false;
+    }
+    char j[TX_JSON_MAX];
+    (void)snprintf(j, sizeof j, "{\"evt\":\"rejected\",\"cmd\":\"%s\",\"ok\":false,\"code\":\"%s\",\"msg\":\"%s\"}",
+                   CMD_NAME[c->type], code, why);
+    tx_post(c->route, true, why, j);
+    ESP_LOGW(TAG, "COMMS: rejected %s (%s)", CMD_NAME[c->type], code);
+    return true;
+}
+
+// [COMMS-STOW] begin
+/* Comms fault: once per latch, every arm that is not on LS1 and not in
+ * another fault stows by itself (unlock first, saved default speed, all
+ * stow checks + LS1 search). An arm the comms trip already stopped
+ * (FAULT / COMMS) is included. Motion task only. */
+static bool s_comms_stow_started;
+
+static void comms_autostow_start(int64_t t)
+{
+    bool any = false;
+    for (uint32_t i = 0U; i < (uint32_t)ARM_COUNT; i++) {
+        const arm_id_t id = (arm_id_t)i;
+        arm_t *a = &s_arm[id];
+        if ((a->state == ST_FAULT) && (a->fault != FLT_COMMS)) { continue; }   /* own fault: stays */
+        if (a->lim_stow && a->lim_deploy) { continue; }                          /* BOTH_LIMITS */
+        if (a->lim_stow && !arm_is_moving(a)) { continue; }                      /* already on LS1 */
+        if (arm_is_moving(a)) { arm_stop_output(id, t); a->drive_started = false; }
+        // [LS-REF] begin — on LS1 (moving away just now): stopped, stays stowed
+        if (a->lim_stow) {
+            a->timed = false; a->group_id = 0U; a->speed_override = 0.0f;
+            a->state = ST_STOWED;                 /* zeroed + latched next tick */
+            a->ls1_ref_done = false;
+            continue;
+        }
+        // [LS-REF] end
+        a->f1 = 0U; a->f2 = 0U; a->time_used_ms = 0U;   /* full window; f2 set if it stops part-way */
+        a->group_id = 0U;
+        const float sp = (fabsf(s_speed) < MIN_SPEED) ? MIN_SPEED : 0.0f;       /* 0 = saved default */
+        if (arm_start_move(id, DIR_STOW, ROUTE_AUTO, t, "comms_stow", sp, 0U)) {
+            a->comms_stow = true;
+            any = true;
+            ESP_LOGW(TAG, "%s COMMS auto-stow started", ARM_HW[id].name);
+        }
+    }
+    if (any) {
+        tx_simple(ROUTE_AUTO, true, "failsafe", "COMMS_STOW",
+                  "COMMS_STOW: host link lost - stowing to LS1, then latched");
+    }
+}
+
+/* Every motion tick: start the auto-stow once per latch, then latch every
+ * arm that is not moving and not in another fault as FAULT / COMMS (an
+ * auto-stowing arm is latched when it reaches LS1 or stops). */
+static void comms_motion_step(int64_t t)
+{
+    if (atomic_load(&s_comms_state) == (uint32_t)COMMS_OK) {
+        s_comms_stow_started = false;
+        return;
+    }
+    if (!s_comms_stow_started) {
+        s_comms_stow_started = true;
+        comms_autostow_start(t);
+    }
+    for (uint32_t i = 0U; i < (uint32_t)ARM_COUNT; i++) {
+        arm_t *a = &s_arm[i];
+        if (arm_is_moving(a) || (a->state == ST_FAULT)) { continue; }
+        a->state = ST_FAULT;
+        a->fault = FLT_COMMS;
+        ev_arm(ROUTE_AUTO, true, "fault", "none", (arm_id_t)i, false, "FAULT: COMMS - host link lost, send R after comms return");
+    }
+}
+// [COMMS-STOW] end
+// [COMMS-WDT] end
+
 static void handle_cmd(const cmd_t *c, int64_t t)
 {
+    if (comms_refuse(c)) { return; }          /* [COMMS-WDT] */
     switch (c->type) {
     case CMD_DEPLOY: handle_move_cmd(c, DIR_DEPLOY, t); break;
     case CMD_STOW:   handle_move_cmd(c, DIR_STOW, t);   break;
@@ -2354,6 +2585,25 @@ static void handle_cmd(const cmd_t *c, int64_t t)
         break;
 
     case CMD_RESET: {
+        // [COMMS-WDT] begin — latched comms fault: clear only if a valid host message arrived since
+        if (atomic_load(&s_comms_state) != (uint32_t)COMMS_OK) {
+            // [COMMS-STOW] begin — the auto-stow always finishes first
+            if (s_arm[ARM_PORT].comms_stow || s_arm[ARM_STBD].comms_stow) {
+                tx_simple(c->route, true, "reset_denied", "BUSY", "RESET_DENIED: BUSY - comms auto-stow running, wait for LS1");
+                break;
+            }
+            // [COMMS-STOW] end
+            uint32_t restored = (uint32_t)COMMS_FAULT_RESTORED;
+            if (!atomic_compare_exchange_strong(&s_comms_state, &restored, (uint32_t)COMMS_OK)) {
+                tx_simple(c->route, true, "reset_denied", "COMMS_NOT_RESTORED",
+                          "RESET_DENIED: COMMS_NOT_RESTORED - no host message since the fault");  /* [COMMS-RX-WDT] */
+                ESP_LOGW(TAG, "COMMS: reset refused, comms not restored");
+                break;
+            }
+            atomic_store(&s_comms_fails, 0U);
+            ESP_LOGW(TAG, "COMMS: fault cleared by reset");
+        }
+        // [COMMS-WDT] end
         /* a safety trip is cleared only here (any side) */
         const bool had_trip = safety_tripped();
         if (had_trip && atomic_load(&s_pwm_detached)) {
@@ -2543,7 +2793,7 @@ static void arm_step(arm_id_t id, int64_t t)
     /* ---- starting: wait for unlock settle + dead-time ---- */
     if (a->state == ST_STARTING) {
         a->duty = 0.0f;
-        if (safety_tripped()) {               /* never begin a drive during a trip */
+        if (arm_tripped(a)) {                 /* never begin a drive during a trip [COMMS-STOW] */
             arm_halt(id, t, a->route, a->move_cmd, "warn", false, "SAFETY_TRIP: start cancelled - send R");
             return;
         }
@@ -2559,7 +2809,11 @@ static void arm_step(arm_id_t id, int64_t t)
     }
 
     /* ---- driving (DEPLOYING / STOWING) ---- */
-    if (safety_tripped()) { arm_fault(id, FLT_SAFETY, t); return; }
+    if (arm_tripped(a)) {                     /* [COMMS-STOW] auto-stow keeps driving */
+        /* [COMMS-WDT] report COMMS when the host link is the cause */
+        arm_fault(id, (atomic_load(&s_comms_state) != (uint32_t)COMMS_OK) ? FLT_COMMS : FLT_SAFETY, t);
+        return;
+    }
 
     const bool raw_target = (a->dir == DIR_DEPLOY) ? a->raw_deploy : a->raw_stow;
     const bool deb_target = (a->dir == DIR_DEPLOY) ? a->lim_deploy : a->lim_stow;
@@ -2576,10 +2830,23 @@ static void arm_step(arm_id_t id, int64_t t)
         } else {
             return;                              /* hold PWM 0, check next tick */
         }
-    } else if (!bench_active() &&
-               ((a->dir == DIR_DEPLOY) ? (a->enc_deploy && !a->lim_stow) : (a->enc_stow && !a->lim_deploy))) {
+    } else if (!bench_active() && (a->dir == DIR_DEPLOY) && a->enc_deploy && !a->lim_stow &&
+               (a->count >= (a->stroke + DEPLOY_ENC_END_MARGIN_COUNTS))) {   /* [LS-REF] LS2 first */
         arm_complete(id, t, true);               /* encoder end flag: switch not seen */
         return;
+    // [STOW-LS1] begin — stow ends only on LS1: encoder at 0 -> keep going slowly
+    } else if (!bench_active() && (a->dir == DIR_STOW) && (a->ls1_search || (a->enc_stow && !a->lim_deploy))) {
+        if (!a->ls1_search) {
+            a->ls1_search = true;
+            a->ls1_search_us = t;
+            ev_arm(a->route, true, "warn", a->move_cmd, id, false,
+                   "LS1_SEARCH: encoder at stow, LS1 open - moving on slowly (max 5 s)");
+        }
+        if ((t - a->ls1_search_us) >= ms_to_us(STOW_LS1_SEARCH_MS)) {
+            arm_fault(id, FLT_LS1_NOT_FOUND, t);   /* motor off, count not zeroed */
+            return;
+        }
+    // [STOW-LS1] end
     } else {
         /* not at the target */
     }
@@ -2599,6 +2866,9 @@ static void arm_step(arm_id_t id, int64_t t)
     a->target_duty = arm_speed(a) * 100.0f;
     const int32_t rem = remaining_counts(a, a->dir);
     if ((rem >= 0) && (rem < approach_zone(a)) && (a->target_duty > APPROACH_DUTY_PCT)) {
+        a->target_duty = APPROACH_DUTY_PCT;
+    }
+    if (a->ls1_search && (a->target_duty > APPROACH_DUTY_PCT)) {   /* [STOW-LS1] slow search */
         a->target_duty = APPROACH_DUTY_PCT;
     }
 
@@ -2642,6 +2912,40 @@ static void read_inputs(void)
         a->enc_prev = cur;
         a->count += (int32_t)delta * ARM_HW[id].enc_sign;
         enc_flags_update(a);
+        // [LS-REF] begin — LS1 pressed = count 0, always (saved to NVS).
+        // Stow moves zero at completion (with the mismatch check); every idle
+        // arm on LS1 is (re)zeroed on: first idle tick on LS1 (also after X /
+        // fault / timeout at LS1), each new LS1 press, and drift > DRIFT_COUNTS.
+        const bool ls1_closed = a->lim_stow && !a->lim_stow_prev;
+        a->lim_stow_prev = a->lim_stow;
+        if (!a->lim_stow || a->lim_deploy) {
+            a->ls1_ref_done = false;
+        } else if (!arm_is_moving(a) &&
+                   (!a->ls1_ref_done || ls1_closed || !a->pos_valid || (labs((long)a->count) > (long)DRIFT_COUNTS))) {
+            const int32_t old = a->count;
+            const bool had_pos = a->pos_valid;
+            if (had_pos && (labs((long)old) > (long)MISMATCH_COUNTS)) {
+                char msg[64];
+                (void)snprintf(msg, sizeof msg, "ENCODER_MISMATCH: count %ld at LS1 (idle)", (long)old);
+                ev_arm(a->route, true, "warn", "none", id, false, msg);
+            }
+            enc_zero(id);                        /* count = 0, pos_valid = 1 */
+            a->idle_ref_count = 0;
+            a->idle_seq++;
+            if (a->state != ST_FAULT) {          /* on LS1 = stowed: no f1/f2 left */
+                a->state = ST_STOWED;
+                a->f1 = 0U; a->f2 = 0U; a->time_used_ms = 0U;
+                lock_align(id, a->route);        /* lock open at stow */
+            }
+            nvs_save_arm(id);                    /* writes only if the record changed */
+            a->ls1_ref_done = true;
+            if (!had_pos || (old != 0)) {
+                ESP_LOGI(TAG, "%s on LS1: count %ld -> 0 (saved)", ARM_HW[id].name, (long)old);
+            }
+        } else {
+            /* moving, or already referenced */
+        }
+        // [LS-REF] end
     }
 }
 
@@ -2713,6 +3017,7 @@ static void motion_tick(void)
     while (xQueueReceive(s_req_q, &r, 0) == pdTRUE) {
         handle_req(&r, t);
     }
+    comms_motion_step(t);                     /* [COMMS-WDT] / [COMMS-STOW] */
 
     for (uint32_t i = 0U; i < (uint32_t)ARM_COUNT; i++) {
         arm_step((arm_id_t)i, t);
@@ -2723,7 +3028,7 @@ static void motion_tick(void)
      * no safety trip is latched (checked in motor_out) */
     for (uint32_t i = 0U; i < (uint32_t)ARM_COUNT; i++) {
         arm_t *a = &s_arm[i];
-        if ((s_lock_state[i] != LOCK_UNLOCKED) || safety_tripped()) { a->duty = 0.0f; }
+        if ((s_lock_state[i] != LOCK_UNLOCKED) || arm_tripped(a)) { a->duty = 0.0f; }   /* [COMMS-STOW] */
         motor_out((arm_id_t)i, a->duty, a->dir);
         if (a->drive_started && (a->duty > 0.0f)) {
             a->full_duty_s += (a->duty / 100.0f) * ((float)CONTROL_PERIOD_MS / 1000.0f);
@@ -2984,6 +3289,8 @@ static int parse_json_cmd(const char *line, cmd_t out[2])
         else if (strcmp(cmd->str, "lock") == 0)   { c.type = CMD_LOCK; }
         else if (strcmp(cmd->str, "unlock") == 0) { c.type = CMD_UNLOCK; }
         else if (strcmp(cmd->str, "status") == 0) { c.type = CMD_STATUS; }
+        else if (strcmp(cmd->str, "pong") == 0)   { c.type = CMD_PONG; }      /* [COMMS-WDT] */
+        else if (strcmp(cmd->str, "ping") == 0)   { c.type = CMD_PING; }      /* [COMMS-RX-WDT] */
         else if (strcmp(cmd->str, "start") == 0) {
             c.type = CMD_START;
             const json_pair_t *d = json_find(pairs, np, "direction");
@@ -3148,7 +3455,31 @@ static void cmd_task(void *pv)
             ESP_LOGW(TAG, "uart%u unknown: %.40s", (unsigned)lm.port, p);
             continue;
         }
+        // [COMMS-RX-WDT] begin — a line from the host link that PARSED is a valid
+        // message (any command, also ping / pong / later-refused ones). Garbage,
+        // noise lines (dropped in uart_task) and "Unknown command" never get here.
+        if (lm.port == (uint8_t)UART_SYS_PORT) {
+            atomic_store(&s_comms_rx, true);
+            const bool first = !atomic_exchange(&s_comms_first_ok, true);
+            uint32_t down = (uint32_t)COMMS_FAULT_DOWN;
+            const bool restored = atomic_compare_exchange_strong(&s_comms_state, &down, (uint32_t)COMMS_FAULT_RESTORED);
+            if (first) { ESP_LOGI(TAG, "COMMS: host link up (first message)"); }
+            if (restored) {
+                ESP_LOGW(TAG, "COMMS: comms restored, fault still latched (send R)");
+                tx_simple(ROUTE_AUTO, true, "warn", "COMMS_RESTORED", "COMMS_RESTORED: fault still latched - send R");
+            }
+        }
+        // [COMMS-RX-WDT] end
         for (int i = 0; i < n; i++) {
+            // [COMMS-RX-WDT] begin — pong: valid message only, no reply; ping: reply pong on UART1
+            if (cmds[i].type == CMD_PONG) { continue; }
+            if (cmds[i].type == CMD_PING) {
+                if (lm.port == (uint8_t)UART_SYS_PORT) {
+                    tx_post(ROUTE_SYS_JSON, false, "", "{\"cmd\":\"pong\"}");
+                }
+                continue;                             /* no other effect */
+            }
+            // [COMMS-RX-WDT] end
             if (cmds[i].type == CMD_STATUS) {         /* answered here from the snapshot */
                 static sys_snap_t ss;
                 if (snap_get(&ss)) { status_report(cmds[i].route, &ss); }
@@ -3277,6 +3608,11 @@ static void uart_task(void *pv)
                 uart_put_line(UART_FLASH_PORT, m.json);
                 uart_put_line(UART_SYS_PORT, m.json);
                 break;
+            // [COMMS-WDT] begin
+            case ROUTE_SYS_JSON:
+                uart_put_line(UART_SYS_PORT, m.json);    /* host link only    */
+                break;
+            // [COMMS-WDT] end
             case ROUTE_AUTO:
             default:
                 uart_put_line(UART_FLASH_PORT, m.text);
@@ -3388,12 +3724,65 @@ static fault_t mon_check(mon_t *m, const arm_snap_t *s, int64_t t)
     if (travel < -WRONG_DIR_COUNTS) { return FLT_WRONG_DIR; }
     if (s->pos_valid) {
         if (deploy && (s->count > snap_fwd_overtravel_limit(s))) { return FLT_OVERTRAVEL; }
-        if (!deploy && (s->count < -END_MARGIN_COUNTS))           { return FLT_OVERTRAVEL; }
+        if (!deploy && !s->ls1_search && (s->count < -END_MARGIN_COUNTS)) { return FLT_OVERTRAVEL; }  /* [STOW-LS1] search: 5 s cap */
     } else if (travel > MAX_STROKE_COUNTS) {
         return FLT_OVERTRAVEL;
     }
     return FLT_NONE;
 }
+
+// [COMMS-RX-WDT] begin
+/* Host link supervisor, called every status_task loop (20 ms). Every
+ * COMMS_CHECK_INTERVAL_MS it checks whether cmd_task saw a valid message from
+ * UART1 in that window: yes -> fail counter 0; no -> +1 ("COMMS no rx n/3").
+ * Empty windows count only after the first valid message since boot;
+ * COMMS_MAX_FAILS in a row -> latched COMMS FAULT (safe state via
+ * safety_tripped()). Only real received messages set the flag, unless the
+ * bench flag COMMS_TEST_SELF_HEARTBEAT is 1. Logging outside any lock. */
+static void comms_step(int64_t t)
+{
+    static int64_t win_start_us = -1;            /* first window starts here */
+    if (win_start_us < 0) { win_start_us = t; }
+#if COMMS_TEST_SELF_HEARTBEAT
+    atomic_store(&s_comms_first_ok, true);       /* bench: no host needed */
+#endif
+    if ((t - win_start_us) < ms_to_us(COMMS_CHECK_INTERVAL_MS)) { return; }
+    win_start_us = t;
+
+#if COMMS_DEVICE_PING_ENABLE
+    tx_post(ROUTE_SYS_JSON, true, "", "{\"cmd\":\"ping\"}");   /* optional; the window decides */
+#endif
+#if COMMS_TEST_SELF_HEARTBEAT
+    atomic_store(&s_comms_rx, true);             /* bench: every window passes */
+#endif
+
+    if (atomic_exchange(&s_comms_rx, false)) {   /* ---- window passed ---- */
+        atomic_store(&s_comms_fails, 0U);
+        return;
+    }
+    /* ---- window failed ---- */
+    if (!atomic_load(&s_comms_first_ok)) {
+        ESP_LOGD(TAG, "COMMS: no host message yet since boot");
+        return;
+    }
+    uint32_t restored = (uint32_t)COMMS_FAULT_RESTORED;   /* lost again before R */
+    (void)atomic_compare_exchange_strong(&s_comms_state, &restored, (uint32_t)COMMS_FAULT_DOWN);
+    uint32_t n = atomic_load(&s_comms_fails);
+    if (n < COMMS_MAX_FAILS) { n++; atomic_store(&s_comms_fails, n); }
+    uint32_t ok = (uint32_t)COMMS_OK;
+    if ((n >= COMMS_MAX_FAILS) &&
+        atomic_compare_exchange_strong(&s_comms_state, &ok, (uint32_t)COMMS_FAULT_DOWN)) {
+        ESP_LOGE(TAG, "COMMS no rx %lu/%u - COMMS FAULT latched, motion stopped",
+                 (unsigned long)n, (unsigned)COMMS_MAX_FAILS);
+        tx_simple(ROUTE_AUTO, true, "failsafe", "COMMS_FAULT",
+                  "COMMS_FAULT: no host message - motion stopped, send R after comms return");
+    } else if (atomic_load(&s_comms_state) != (uint32_t)COMMS_OK) {
+        ESP_LOGW(TAG, "COMMS no rx (fault latched)");
+    } else {
+        ESP_LOGW(TAG, "COMMS no rx %lu/%u", (unsigned long)n, (unsigned)COMMS_MAX_FAILS);
+    }
+}
+// [COMMS-RX-WDT] end
 
 static void status_task(void *pv)
 {
@@ -3409,6 +3798,7 @@ static void status_task(void *pv)
         xTaskDelayUntil(&last, pdMS_TO_TICKS(STATUS_PERIOD_MS));
         (void)esp_task_wdt_reset();
         (void)atomic_fetch_add(&s_status_beat, 1U);
+        comms_step(now_us());                 /* [COMMS-WDT] */
         if (!snap_get(&ss)) { continue; }
         const int64_t t = now_us();
 
