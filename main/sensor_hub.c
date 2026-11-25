@@ -245,16 +245,21 @@
  *   SWITCH_STUCK. [STOW-LS1] EXCEPTION — a stow ends ONLY on the physical
  *   LS1: at enc1 with LS1 open it goes on at 25 % duty (warn LS1_SEARCH)
  *   for up to STOW_LS1_SEARCH_MS (5 s, STALL still active, reverse
- *   OVERTRAVEL off) -> LS1 = normal completion, count = 0; not found ->
- *   FAULT LS1_NOT_FOUND (motor off, count not zeroed). stow / start-reverse
+ *   OVERTRAVEL off) -> LS1 = normal completion, count = 0; not found by
+ *   count -LS_SEARCH_MARGIN_COUNTS (200) or 5 s ->
+ *   FAULT LS1_NOT_FOUND (motor off, count not zeroed).
+ *   [LS-FIRST] a deploy ends ONLY on the physical LS2: past the stroke it
+ *   goes on at 25 % (approach cap); count >= stroke + LS_SEARCH_MARGIN_COUNTS
+ *   (200) with LS2 open -> FAULT LS2_NOT_FOUND (motor off). The encoder no
+ *   longer completes a deploy. stow / start-reverse
  *   answer ALREADY_STOWED only with LS1 closed, never POSITION_CONFLICT.
  *   [LS-REF] LS1 pressed = count 0, saved to NVS: at stow completion, at
  *   boot, and for every idle arm on LS1 (first idle tick, each new press,
  *   drift > ~1.3 cm; mismatch > ~2.7 cm warned); an idle arm on LS1 is
  *   STOWED with f1 = f2 = 0 (FAULT kept). With LS1 pressed a stow / start
  *   reverse / comms auto-stow never drives (ALREADY_STOWED, also with f2).
- *   Deploy: the encoder ends it only at stroke + 20 counts (~2.7 cm) with
- *   LS2 not seen, so LS2 normally ends every deploy (and relearns stroke). A closed physical switch wins over the other end's
+ *   Deploy: [LS-FIRST] only LS2 ends it (and relearns stroke); stroke + 200
+ *   counts with LS2 open -> FAULT LS2_NOT_FOUND. A closed physical switch wins over the other end's
  *   encoder flag. BOTH_LIMITS stays a physical-switch fault. The switch is
  *   checked first; a move ended by the encoder reports "...: encoder end,
  *   LSx not seen" and is otherwise identical (lock at deploy, NVS, events).
@@ -360,7 +365,7 @@
  *     stopped   OK ("Ack: Stopped") / TIME_ELAPSED
  *     fault     FAULT / SWITCH_FAULT / SERVO_ERR   (fault= gives the reason:
  *               BOTH_LIMITS WRONG_LIMIT SWITCH_STUCK STALL WRONG_DIR
- *               OVERTRAVEL TIMEOUT SAFETY COMMS LS1_NOT_FOUND)
+ *               OVERTRAVEL TIMEOUT SAFETY COMMS LS1_NOT_FOUND LS2_NOT_FOUND)
  *     locked / unlocked   LOCKED / UNLOCKED
  *     lock_denied LOCK_DENIED  unlock_denied UNLOCK_DENIED
  *     reset_denied RESET_DENIED (both switches closed)
@@ -593,8 +598,8 @@ _Static_assert((COMMS_DEVICE_PING_ENABLE == 0) || (COMMS_DEVICE_PING_ENABLE == 1
 #define STOW_LS1_SEARCH_MS      5000U       /* encoder at stow, LS1 open: keep stowing slowly up to 5 s */
 // [STOW-LS1] end
 // [LS-REF] begin
-#define DEPLOY_ENC_END_MARGIN_COUNTS 20     /* ~2.7 cm: encoder ends a deploy only this far past the stroke, so LS2 ends it normally */
-_Static_assert(DEPLOY_ENC_END_MARGIN_COUNTS < END_MARGIN_COUNTS, "encoder deploy end must stay inside the overtravel margin");
+#define LS_SEARCH_MARGIN_COUNTS 200         /* [LS-FIRST] ~26.7 cm: past the encoder end (stroke / 0) with the switch open -> LSx_NOT_FOUND */
+_Static_assert(LS_SEARCH_MARGIN_COUNTS > 0, "limit switch search margin");
 // [LS-REF] end
 #define DEFAULT_SPEED           0.50f
 #define SPEED_SAVE_EPS          0.005f
@@ -693,6 +698,7 @@ typedef enum {
     FLT_STALL, FLT_WRONG_DIR, FLT_OVERTRAVEL, FLT_TIMEOUT, FLT_SAFETY,
     FLT_COMMS,                                  /* [COMMS-WDT] host link lost (latched) */
     FLT_LS1_NOT_FOUND,                          /* [STOW-LS1] LS1 not reached within the search */
+    FLT_LS2_NOT_FOUND,                          /* [LS-FIRST] LS2 not reached by stroke + margin */
     FLT__COUNT
 } fault_t;
 
@@ -979,7 +985,8 @@ static const char *const FAULT_NAME[FLT__COUNT] = {
     "NONE", "BOTH_LIMITS", "WRONG_LIMIT", "SWITCH_STUCK",
     "STALL", "WRONG_DIR", "OVERTRAVEL", "TIMEOUT", "SAFETY",
     "COMMS",                                    /* [COMMS-WDT] */
-    "LS1_NOT_FOUND"                             /* [STOW-LS1] */
+    "LS1_NOT_FOUND",                            /* [STOW-LS1] */
+    "LS2_NOT_FOUND"                             /* [LS-FIRST] */
 };
 static const char *const LOCK_NAME[LOCK__COUNT] = {
     "UNKNOWN", "LOCKED", "UNLOCKED", "LOCKING", "UNLOCKING"
@@ -2831,8 +2838,8 @@ static void arm_step(arm_id_t id, int64_t t)
             return;                              /* hold PWM 0, check next tick */
         }
     } else if (!bench_active() && (a->dir == DIR_DEPLOY) && a->enc_deploy && !a->lim_stow &&
-               (a->count >= (a->stroke + DEPLOY_ENC_END_MARGIN_COUNTS))) {   /* [LS-REF] LS2 first */
-        arm_complete(id, t, true);               /* encoder end flag: switch not seen */
+               (a->count >= (a->stroke + LS_SEARCH_MARGIN_COUNTS))) {   /* [LS-FIRST] LS2 always ends a deploy */
+        arm_fault(id, FLT_LS2_NOT_FOUND, t);     /* past stroke + margin, LS2 open: motor off */
         return;
     // [STOW-LS1] begin — stow ends only on LS1: encoder at 0 -> keep going slowly
     } else if (!bench_active() && (a->dir == DIR_STOW) && (a->ls1_search || (a->enc_stow && !a->lim_deploy))) {
@@ -2840,9 +2847,10 @@ static void arm_step(arm_id_t id, int64_t t)
             a->ls1_search = true;
             a->ls1_search_us = t;
             ev_arm(a->route, true, "warn", a->move_cmd, id, false,
-                   "LS1_SEARCH: encoder at stow, LS1 open - moving on slowly (max 5 s)");
+                   "LS1_SEARCH: encoder at stow, LS1 open - moving on slowly (max 200 counts / 5 s)");
         }
-        if ((t - a->ls1_search_us) >= ms_to_us(STOW_LS1_SEARCH_MS)) {
+        if ((a->count <= -LS_SEARCH_MARGIN_COUNTS) ||                      /* [LS-FIRST] */
+            ((t - a->ls1_search_us) >= ms_to_us(STOW_LS1_SEARCH_MS))) {
             arm_fault(id, FLT_LS1_NOT_FOUND, t);   /* motor off, count not zeroed */
             return;
         }
@@ -3724,7 +3732,9 @@ static fault_t mon_check(mon_t *m, const arm_snap_t *s, int64_t t)
     if (travel < -WRONG_DIR_COUNTS) { return FLT_WRONG_DIR; }
     if (s->pos_valid) {
         if (deploy && (s->count > snap_fwd_overtravel_limit(s))) { return FLT_OVERTRAVEL; }
-        if (!deploy && !s->ls1_search && (s->count < -END_MARGIN_COUNTS)) { return FLT_OVERTRAVEL; }  /* [STOW-LS1] search: 5 s cap */
+        /* [STOW-LS1] stow behind 0: enc1 is on, so the LS1 search (5 s cap,
+         * STALL) owns it — also in the tick before ls1_search is set */
+        if (!deploy && !s->ls1_search && !s->enc1 && (s->count < -END_MARGIN_COUNTS)) { return FLT_OVERTRAVEL; }
     } else if (travel > MAX_STROKE_COUNTS) {
         return FLT_OVERTRAVEL;
     }
